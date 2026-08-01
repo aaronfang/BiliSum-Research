@@ -6,6 +6,8 @@
 
 **AI 视频总结与知识库工具**
 
+> **BiliSum Research fork**: This repository is evolving BiliSum into a local-first, evidence-driven video research system with subtitle-first processing, targeted frame verification, resumable batches, verified tool links, Obsidian-native publishing, and bounded multi-video research campaigns. Start with the [project documentation](docs/README.md), [product vision](docs/product/vision.md), and [MVP specification](docs/specs/mvp.md). The upstream project remains [lycohana/BiliSum](https://github.com/lycohana/BiliSum).
+
 把 B 站、YouTube 和本地视频，沉淀成可检索、可追问、可导出的知识笔记。
 
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
