@@ -4,6 +4,7 @@ from video_sum_core.evidence.models import (
     EvidenceItem,
     EvidenceKind,
     EvidenceSet,
+    FrameObservation,
     FrameSample,
     TextAnchor,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "EvidenceItem",
     "EvidenceKind",
     "EvidenceSet",
+    "FrameObservation",
     "FrameSample",
     "MediaSource",
     "TextAnchor",

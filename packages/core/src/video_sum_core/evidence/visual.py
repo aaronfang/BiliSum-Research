@@ -2,12 +2,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from video_sum_core.evidence.engine import EvidenceEngine
-from video_sum_core.evidence.models import FrameSample
+from video_sum_core.evidence.models import FrameObservation, FrameSample
 from video_sum_core.transcript import MediaSource
 
 RawFrame = dict[str, object]
 ExtractFrames = Callable[[MediaSource, list[float], Path], list[RawFrame]]
-ReadFrame = Callable[[RawFrame], tuple[str, float]]
+ReadFrame = Callable[[RawFrame], FrameObservation]
 
 
 def build_visual_evidence_engine(
@@ -44,10 +44,10 @@ def build_visual_evidence_engine(
             return samples
 
     class VisualFrameTextReader:
-        def read(self, frame: FrameSample) -> tuple[str, float]:
+        def read(self, frame: FrameSample) -> FrameObservation:
             raw_frame = raw_frames.get(frame.frame_id)
             if raw_frame is None:
-                return "", 0.0
+                return FrameObservation(text="", confidence=0.0)
             return read_frame(raw_frame)
 
     return EvidenceEngine(

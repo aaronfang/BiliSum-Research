@@ -35,6 +35,15 @@ class FrameSample(BaseModel):
     path: Path
 
 
+class FrameObservation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    confidence: float = Field(ge=0, le=1)
+    scene_signature: str = ""
+    quality_score: float = Field(default=0.5, ge=0, le=1)
+
+
 class EvidenceItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 

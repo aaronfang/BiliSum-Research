@@ -57,6 +57,7 @@ from video_sum_core.errors import (
 from video_sum_core.evidence import (
     EvidenceBudget,
     EvidenceEngine,
+    FrameObservation,
     build_visual_evidence_engine,
 )
 from video_sum_core.fusion import FusionEngine, TranscriptFusionWorkflow
@@ -779,7 +780,7 @@ class RealPipelineRunner(PipelineRunner):
                 frame["_analysis_absolute_path"] = frame.get("_absolute_path")
             return frames
 
-        def read_frame(frame: dict[str, object]) -> tuple[str, float]:
+        def read_frame(frame: dict[str, object]) -> FrameObservation:
             observations = self._describe_visual_frames(
                 [frame],
                 title,
@@ -787,14 +788,25 @@ class RealPipelineRunner(PipelineRunner):
                 image_detail="high",
             )
             if not observations:
-                return "", 0.0
+                return FrameObservation(text="", confidence=0.0)
             observation = observations[0]
             text = str(observation.get("ocr_text") or "").strip()
             try:
                 confidence = float(observation.get("confidence") or 0.0)
             except (TypeError, ValueError):
                 confidence = 0.0
-            return text, max(0.0, min(1.0, confidence))
+            try:
+                quality = float(observation.get("image_quality") or confidence)
+            except (TypeError, ValueError):
+                quality = confidence
+            return FrameObservation(
+                text=text,
+                confidence=max(0.0, min(1.0, confidence)),
+                scene_signature=str(
+                    observation.get("scene") or observation.get("visual_type") or ""
+                ),
+                quality_score=max(0.0, min(1.0, quality)),
+            )
 
         return build_visual_evidence_engine(
             evidence_dir=evidence_dir,
@@ -4069,7 +4081,7 @@ P 数索引：
             prompt = self._settings.visual_vlm_prompt.strip() or (
                 "提取画面中的客观信息输出 JSON。不要叙述、不要评价、不要写「该画面」。"
                 "字段：visual_type, caption, ocr_text, key_facts, semantic_summary, importance, should_insert, "
-                "suggested_anchor, scene, confidence。"
+                "suggested_anchor, scene, confidence, image_quality。"
                 "\n视频标题：{title}\n时间点：{timestamp}\n章节线索：\n{timeline_hint}"
             )
             try:
@@ -4143,6 +4155,7 @@ P 数索引：
                             "suggested_anchor": str(parsed.get("suggested_anchor") or "").strip()[:120],
                             "scene": str(parsed.get("scene") or "unknown").strip()[:64],
                             "confidence": parsed.get("confidence"),
+                            "image_quality": parsed.get("image_quality"),
                         }
                     )
                     break
@@ -4167,6 +4180,7 @@ P 数索引：
                         "suggested_anchor": "",
                         "scene": "unknown",
                         "confidence": None,
+                        "image_quality": None,
                     }
                 )
         return observations

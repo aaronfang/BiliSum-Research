@@ -5,6 +5,7 @@ from video_sum_core.evidence.models import (
     EvidenceItem,
     EvidenceKind,
     EvidenceSet,
+    FrameObservation,
     FrameSample,
     TextAnchor,
 )
@@ -16,7 +17,7 @@ class FrameExtractor(Protocol):
 
 
 class FrameTextReader(Protocol):
-    def read(self, frame: FrameSample) -> tuple[str, float]: ...
+    def read(self, frame: FrameSample) -> FrameObservation: ...
 
 
 class EvidenceEngine:
@@ -36,11 +37,12 @@ class EvidenceEngine:
             if remaining <= 0:
                 break
             timestamps = self._timestamps(anchor, budget)[:remaining]
-            for frame in self._frame_extractor.extract(media, timestamps):
-                observed_text, confidence = self._text_reader.read(frame)
-                normalized_text = observed_text.strip()
-                if not normalized_text:
-                    continue
+            observed_frames = [
+                (frame, self._text_reader.read(frame))
+                for frame in self._frame_extractor.extract(media, timestamps)
+            ]
+            for frame, observation in self._select_frames(observed_frames):
+                normalized_text = observation.text.strip()
                 items.append(
                     EvidenceItem(
                         evidence_id=f"{anchor.anchor_id}:{frame.frame_id}",
@@ -48,8 +50,8 @@ class EvidenceEngine:
                         observed_text=normalized_text,
                         start=frame.timestamp,
                         end=frame.timestamp,
-                        confidence=confidence,
-                        derivation_method="frame_ocr",
+                        confidence=observation.confidence,
+                        derivation_method="frame_ocr_scene_quality",
                         source_ref=str(frame.path),
                         media_ref=str(media.path),
                         anchor_id=anchor.anchor_id,
@@ -57,6 +59,35 @@ class EvidenceEngine:
                 )
             remaining -= len(timestamps)
         return EvidenceSet(items=tuple(items))
+
+    def _select_frames(
+        self,
+        candidates: list[tuple[FrameSample, FrameObservation]],
+    ) -> list[tuple[FrameSample, FrameObservation]]:
+        ranked = sorted(
+            (
+                (frame, observation)
+                for frame, observation in candidates
+                if observation.text.strip()
+            ),
+            key=lambda candidate: (
+                -candidate[1].quality_score,
+                -candidate[1].confidence,
+                candidate[0].timestamp,
+            ),
+        )
+        selected: list[tuple[FrameSample, FrameObservation]] = []
+        signatures: set[tuple[str, str]] = set()
+        for frame, observation in ranked:
+            signature = (
+                " ".join(observation.text.casefold().split()),
+                observation.scene_signature.casefold().strip(),
+            )
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            selected.append((frame, observation))
+        return sorted(selected, key=lambda candidate: candidate[0].timestamp)
 
     def _timestamps(self, anchor: TextAnchor, budget: EvidenceBudget) -> list[float]:
         center = (anchor.start + anchor.end) / 2

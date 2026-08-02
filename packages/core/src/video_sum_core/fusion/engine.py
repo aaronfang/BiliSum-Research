@@ -91,7 +91,7 @@ class FusionEngine:
         competing = [
             proposal
             for proposal in proposals[1:]
-            if proposal[1].casefold() == from_value.casefold() and proposal[0] >= score - 0.05
+            if proposal[1].casefold() == from_value.casefold()
         ]
         has_visual_support = any(
             item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
