@@ -104,6 +104,47 @@ def test_reconcile_corrects_multiple_independent_tokens_in_one_segment() -> None
     }
 
 
+def test_reconcile_does_not_audit_overlapping_noop_corrections() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(
+            TranscriptSegment(
+                start=11,
+                end=14,
+                text="Loof Engineering uses Pythom 3.12",
+            ),
+        ),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-combined",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineering uses Python 3.12",
+                start=12,
+                end=12,
+                confidence=0.98,
+                derivation_method="frame_ocr_scene_quality",
+                source_ref="frame-combined.jpg",
+                media_ref="video.mp4",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loop Engineering uses Python 3.12"
+    assert {(item.from_value, item.to_value) for item in corrected.corrections} == {
+        ("Loof Engineering", "Loop Engineering"),
+        ("Pythom 3.12", "Python 3.12"),
+    }
+    assert all(item.decision is CorrectionDecision.ACCEPTED for item in corrected.corrections)
+
+
 def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
     raw = Transcript(
         source=TranscriptSource(

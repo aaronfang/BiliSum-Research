@@ -1,5 +1,6 @@
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from video_sum_core.evidence import EvidenceItem, EvidenceKind, EvidenceSet
@@ -11,15 +12,27 @@ from video_sum_core.fusion.models import (
 )
 from video_sum_core.transcript import Transcript, TranscriptSegment
 
-CorrectionProposal = tuple[
-    str,
-    str,
-    list[EvidenceItem],
-    float,
-    CorrectionDecision,
-    tuple[CorrectionAlternative, ...],
-]
-ScoredCandidate = tuple[float, str, str, list[EvidenceItem]]
+
+@dataclass(frozen=True)
+class _ScoredCandidate:
+    score: float
+    start: int
+    end: int
+    from_value: str
+    to_value: str
+    supporting: tuple[EvidenceItem, ...]
+
+
+@dataclass(frozen=True)
+class _CorrectionProposal:
+    start: int
+    end: int
+    from_value: str
+    to_value: str
+    supporting: tuple[EvidenceItem, ...]
+    confidence: float
+    decision: CorrectionDecision
+    alternatives: tuple[CorrectionAlternative, ...]
 
 
 class FusionEngine:
@@ -30,23 +43,28 @@ class FusionEngine:
         corrections: list[Correction] = []
         for segment_index, segment in enumerate(transcript.segments):
             aligned = [item for item in evidence.items if self._overlaps(segment, item)]
-            segment_text = segment.text
-            for proposal in self._proposals(segment.text, aligned, evidence.context_hints):
-                from_value, to_value, supporting, confidence, decision, alternatives = proposal
+            proposals = self._proposals(segment.text, aligned, evidence.context_hints)
+            for proposal in proposals:
                 corrections.append(
                     Correction(
                         segment_index=segment_index,
-                        from_value=from_value,
-                        to_value=to_value,
-                        evidence_ids=tuple(item.evidence_id for item in supporting),
-                        confidence=confidence,
+                        from_value=proposal.from_value,
+                        to_value=proposal.to_value,
+                        evidence_ids=tuple(
+                            item.evidence_id for item in proposal.supporting
+                        ),
+                        confidence=proposal.confidence,
                         rule_version=self.RULE_VERSION,
-                        decision=decision,
-                        alternatives=alternatives,
+                        decision=proposal.decision,
+                        alternatives=proposal.alternatives,
                     )
                 )
-                if decision is CorrectionDecision.ACCEPTED:
-                    segment_text = segment_text.replace(from_value, to_value, 1)
+            accepted = [
+                proposal
+                for proposal in proposals
+                if proposal.decision is CorrectionDecision.ACCEPTED
+            ]
+            segment_text = self._apply(segment.text, accepted)
             if segment_text != segment.text:
                 segments[segment_index] = segment.model_copy(
                     update={"text": segment_text}
@@ -60,12 +78,22 @@ class FusionEngine:
     def _overlaps(self, segment: TranscriptSegment, item: EvidenceItem) -> bool:
         return item.start <= segment.end and item.end >= segment.start
 
+    def _apply(self, text: str, proposals: list[_CorrectionProposal]) -> str:
+        parts: list[str] = []
+        cursor = 0
+        for proposal in proposals:
+            parts.append(text[cursor : proposal.start])
+            parts.append(proposal.to_value)
+            cursor = proposal.end
+        parts.append(text[cursor:])
+        return "".join(parts)
+
     def _proposals(
         self,
         segment_text: str,
         evidence: list[EvidenceItem],
         context_hints: tuple[str, ...],
-    ) -> list[CorrectionProposal]:
+    ) -> list[_CorrectionProposal]:
         grouped: dict[str, list[EvidenceItem]] = defaultdict(list)
         display_value: dict[str, str] = {}
         for item in evidence:
@@ -74,65 +102,84 @@ class FusionEngine:
                 grouped[key].append(item)
                 display_value[key] = candidate
 
-        candidates: list[ScoredCandidate] = []
+        candidates: list[_ScoredCandidate] = []
         for key, supporting in grouped.items():
             candidate = display_value[key]
             match = self._nearest_window(segment_text, candidate)
             if match is None:
                 continue
-            from_value, similarity = match
+            from_value, similarity, start, end = match
             if from_value.casefold() == candidate.casefold() or similarity < 0.78:
                 continue
             evidence_confidence = max(item.confidence for item in supporting)
             score = round(similarity * 0.55 + evidence_confidence * 0.45, 4)
             if any(candidate.casefold() in hint.casefold() for hint in context_hints):
                 score = min(1.0, round(score + 0.02, 4))
-            candidates.append((score, from_value, candidate, supporting))
+            candidates.append(
+                _ScoredCandidate(
+                    score=score,
+                    start=start,
+                    end=end,
+                    from_value=from_value,
+                    to_value=candidate,
+                    supporting=tuple(supporting),
+                )
+            )
 
-        by_source: dict[str, list[ScoredCandidate]] = defaultdict(list)
+        by_source: dict[tuple[int, int], list[_ScoredCandidate]] = defaultdict(list)
         for candidate in candidates:
-            by_source[candidate[1].casefold()].append(candidate)
+            by_source[(candidate.start, candidate.end)].append(candidate)
 
-        proposals: list[CorrectionProposal] = []
+        proposals: list[_CorrectionProposal] = []
         for grouped_candidates in by_source.values():
-            grouped_candidates.sort(key=lambda proposal: proposal[0], reverse=True)
-            score, from_value, candidate, supporting = grouped_candidates[0]
+            grouped_candidates.sort(key=lambda proposal: proposal.score, reverse=True)
+            winner = grouped_candidates[0]
             competing = grouped_candidates[1:]
             has_visual_support = any(
                 item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
-                for item in supporting
+                for item in winner.supporting
             )
             decision = (
                 CorrectionDecision.ACCEPTED
-                if has_visual_support and not competing and score >= 0.88
+                if has_visual_support and not competing and winner.score >= 0.88
                 else CorrectionDecision.UNCERTAIN
             )
             alternatives = ()
             if decision is CorrectionDecision.UNCERTAIN:
                 alternatives = tuple(
                     CorrectionAlternative(
-                        value=proposal_candidate,
-                        evidence_ids=tuple(item.evidence_id for item in proposal_supporting),
-                        confidence=proposal_score,
+                        value=item.to_value,
+                        evidence_ids=tuple(
+                            evidence.evidence_id for evidence in item.supporting
+                        ),
+                        confidence=item.score,
                     )
-                    for proposal_score, _from, proposal_candidate, proposal_supporting in (
-                        grouped_candidates
-                    )
+                    for item in grouped_candidates
                 )
             proposals.append(
-                (
-                    from_value,
-                    candidate,
-                    supporting,
-                    score,
-                    decision,
-                    alternatives,
+                _CorrectionProposal(
+                    start=winner.start,
+                    end=winner.end,
+                    from_value=winner.from_value,
+                    to_value=winner.to_value,
+                    supporting=winner.supporting,
+                    confidence=winner.score,
+                    decision=decision,
+                    alternatives=alternatives,
                 )
             )
-        return sorted(
+        selected: list[_CorrectionProposal] = []
+        for proposal in sorted(
             proposals,
-            key=lambda proposal: segment_text.casefold().find(proposal[0].casefold()),
-        )
+            key=lambda item: (item.end - item.start, -item.confidence, item.start),
+        ):
+            if any(
+                proposal.start < existing.end and proposal.end > existing.start
+                for existing in selected
+            ):
+                continue
+            selected.append(proposal)
+        return sorted(selected, key=lambda proposal: proposal.start)
 
     def _technical_candidates(self, observed_text: str) -> list[str]:
         candidates: list[str] = []
@@ -157,20 +204,31 @@ class FusionEngine:
                 match.group(0).rstrip(".,;:!?)\"]}")
                 for match in re.finditer(r"https?://[^\s<]+", line)
             )
+            candidates.extend(
+                match.group(0)
+                for match in re.finditer(
+                    r"\b[A-Z][A-Za-z0-9_+/#.-]*\s+v?\d+(?:\.\d+){1,3}\b",
+                    line,
+                )
+            )
         return list(dict.fromkeys(value for value in candidates if value))
 
-    def _nearest_window(self, text: str, candidate: str) -> tuple[str, float] | None:
+    def _nearest_window(
+        self,
+        text: str,
+        candidate: str,
+    ) -> tuple[str, float, int, int] | None:
         word_count = len(candidate.split())
         token_pattern = r"[A-Za-z0-9_+/#-]+(?:\.[A-Za-z0-9_+/#-]+)*"
         matches = list(re.finditer(token_pattern, text))
         if len(matches) < word_count:
             return None
-        best: tuple[str, float] | None = None
+        best: tuple[str, float, int, int] | None = None
         for index in range(len(matches) - word_count + 1):
             start = matches[index].start()
             end = matches[index + word_count - 1].end()
             window = text[start:end]
             similarity = SequenceMatcher(None, window.casefold(), candidate.casefold()).ratio()
             if best is None or similarity > best[1]:
-                best = (window, similarity)
+                best = (window, similarity, start, end)
         return best
