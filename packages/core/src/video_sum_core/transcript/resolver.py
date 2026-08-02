@@ -1,4 +1,5 @@
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -15,6 +16,14 @@ from video_sum_core.transcript.models import (
 
 class AsrAdapter(Protocol):
     def transcribe(self, source: MediaSource) -> Transcript: ...
+
+
+class CallableAsrAdapter:
+    def __init__(self, callback: Callable[[MediaSource], Transcript]) -> None:
+        self._callback = callback
+
+    def transcribe(self, source: MediaSource) -> Transcript:
+        return self._callback(source)
 
 
 class TranscriptResolver:

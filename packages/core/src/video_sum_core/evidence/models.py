@@ -8,7 +8,6 @@ class EvidenceKind(StrEnum):
     SUBTITLE = "subtitle"
     ASR = "asr"
     FRAME_OCR = "frame_ocr"
-    CONTEXT = "context"
 
 
 class TextAnchor(BaseModel):
@@ -47,6 +46,7 @@ class EvidenceItem(BaseModel):
     confidence: float = Field(ge=0, le=1)
     derivation_method: str
     source_ref: str
+    media_ref: str
     anchor_id: str | None = None
 
 
@@ -54,3 +54,4 @@ class EvidenceSet(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     items: tuple[EvidenceItem, ...] = ()
+    context_hints: tuple[str, ...] = ()

@@ -35,6 +35,7 @@ def test_reconcile_corrects_technical_token_when_aligned_frame_evidence_supports
                 confidence=0.98,
                 derivation_method="frame_ocr",
                 source_ref="frame-1.jpg",
+                media_ref="video.mp4",
                 anchor_id="anchor-1",
             ),
         )
@@ -72,6 +73,7 @@ def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
                 confidence=0.92,
                 derivation_method="frame_ocr",
                 source_ref="frame-1.jpg",
+                media_ref="video.mp4",
             ),
             EvidenceItem(
                 evidence_id="frame-2",
@@ -82,6 +84,7 @@ def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
                 confidence=0.92,
                 derivation_method="frame_ocr",
                 source_ref="frame-2.jpg",
+                media_ref="video.mp4",
             ),
         )
     )
@@ -91,6 +94,10 @@ def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
     assert corrected.text == "Loof Engineering"
     assert len(corrected.corrections) == 1
     assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN
+    assert {item.value for item in corrected.corrections[0].alternatives} == {
+        "Loop Engineering",
+        "Look Engineering",
+    }
 
 
 def test_reconcile_audits_subtitle_asr_visual_and_context_support_together() -> None:
@@ -113,14 +120,15 @@ def test_reconcile_audits_subtitle_asr_visual_and_context_support_together() -> 
                 confidence=confidence,
                 derivation_method=kind.value,
                 source_ref=evidence_id,
+                media_ref="video.mp4",
             )
             for evidence_id, kind, confidence in (
                 ("subtitle-1", EvidenceKind.SUBTITLE, 0.97),
                 ("asr-2", EvidenceKind.ASR, 0.74),
                 ("frame-1", EvidenceKind.FRAME_OCR, 0.98),
-                ("context-1", EvidenceKind.CONTEXT, 0.6),
             )
-        )
+        ),
+        context_hints=("Loop Engineering",),
     )
 
     corrected = FusionEngine().reconcile(raw, evidence)
@@ -131,7 +139,6 @@ def test_reconcile_audits_subtitle_asr_visual_and_context_support_together() -> 
         "subtitle-1",
         "asr-2",
         "frame-1",
-        "context-1",
     )
 
 
@@ -155,11 +162,13 @@ def test_reconcile_extracts_technical_candidate_from_a_full_subtitle_sentence() 
                 confidence=0.97,
                 derivation_method="sidecar",
                 source_ref="talk.srt",
+                media_ref="talk.mp4",
             ),
         )
     )
 
     corrected = FusionEngine().reconcile(raw, evidence)
 
-    assert corrected.text == "We call it Loop Engineering."
+    assert corrected.text == "We call it Loof Engineering."
     assert corrected.corrections[0].evidence_ids == ("subtitle-1",)
+    assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN

@@ -44,6 +44,7 @@ class LoopVisualEvidenceEngine:
                     confidence=0.98,
                     derivation_method="frame_ocr",
                     source_ref=str(media.path.parent / "frame-1.jpg"),
+                    media_ref=str(media.path),
                     anchor_id=anchors[0].anchor_id,
                 ),
             )
@@ -133,10 +134,8 @@ def test_local_media_run_uses_corrected_transcript_and_exports_audit(tmp_path: P
         Path(result.artifacts["correction_audit_path"]).read_text(encoding="utf-8")
     )
     assert audit["corrections"][0]["decision"] == "accepted"
-    assert audit["corrections"][0]["evidence_ids"] == [
-        "frame-1",
-        "context:segment-0-candidate-0",
-    ]
+    assert audit["corrections"][0]["evidence_ids"] == ["frame-1"]
+    assert audit["context_hints"] == ["Loop Engineering"]
 
 
 def test_local_media_fusion_combines_sidecar_asr_and_visual_evidence(tmp_path: Path) -> None:
@@ -172,7 +171,7 @@ def test_local_media_fusion_combines_sidecar_asr_and_visual_evidence(tmp_path: P
         Path(result.artifacts["correction_audit_path"]).read_text(encoding="utf-8")
     )
     kinds = {item["kind"] for item in audit["evidence"]}
-    assert {"asr", "frame_ocr", "context"} <= kinds
+    assert {"asr", "frame_ocr"} <= kinds
     provenance = json.loads(
         Path(result.artifacts["transcript_provenance_path"]).read_text(encoding="utf-8")
     )

@@ -7,6 +7,13 @@ from video_sum_core.evidence import (
     FrameSample,
     MediaSource,
     TextAnchor,
+    TextAnchorPlanner,
+)
+from video_sum_core.transcript import (
+    Transcript,
+    TranscriptSegment,
+    TranscriptSource,
+    TranscriptSourceKind,
 )
 
 
@@ -47,3 +54,32 @@ def test_collect_inspects_only_frames_around_the_text_anchor(tmp_path: Path) -> 
     assert all(item.kind is EvidenceKind.FRAME_OCR for item in evidence.items)
     assert all(item.observed_text == "Loop Engineering" for item in evidence.items)
     assert all(item.anchor_id == "a1" for item in evidence.items)
+    assert all(item.media_ref == str(media.path) for item in evidence.items)
+
+
+def test_text_anchor_planner_covers_commands_urls_versions_numbers_and_tool_names() -> None:
+    transcript = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(
+            TranscriptSegment(
+                start=20,
+                end=30,
+                text=(
+                    "Run `kubectl apply`, then open https://example.com/docs for PostgreSQL "
+                    "v1.2.3; the timeout is 500ms."
+                ),
+            ),
+        ),
+    )
+
+    queries = {anchor.query for anchor in TextAnchorPlanner().plan(transcript)}
+
+    assert "kubectl apply" in queries
+    assert "https://example.com/docs" in queries
+    assert "PostgreSQL" in queries
+    assert "v1.2.3" in queries
+    assert "500ms" in queries

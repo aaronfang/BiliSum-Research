@@ -1,3 +1,4 @@
+from video_sum_core.transcript.legacy import transcript_from_legacy
 from video_sum_core.transcript.models import (
     MediaSource,
     Transcript,
@@ -6,10 +7,11 @@ from video_sum_core.transcript.models import (
     TranscriptSource,
     TranscriptSourceKind,
 )
-from video_sum_core.transcript.resolver import AsrAdapter, TranscriptResolver
+from video_sum_core.transcript.resolver import AsrAdapter, CallableAsrAdapter, TranscriptResolver
 
 __all__ = [
     "AsrAdapter",
+    "CallableAsrAdapter",
     "MediaSource",
     "Transcript",
     "TranscriptPolicy",
@@ -17,4 +19,5 @@ __all__ = [
     "TranscriptSegment",
     "TranscriptSource",
     "TranscriptSourceKind",
+    "transcript_from_legacy",
 ]

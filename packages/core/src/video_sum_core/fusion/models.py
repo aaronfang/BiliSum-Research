@@ -10,6 +10,14 @@ class CorrectionDecision(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class CorrectionAlternative(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    value: str
+    evidence_ids: tuple[str, ...]
+    confidence: float = Field(ge=0, le=1)
+
+
 class Correction(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -20,6 +28,7 @@ class Correction(BaseModel):
     confidence: float = Field(ge=0, le=1)
     rule_version: str
     decision: CorrectionDecision
+    alternatives: tuple[CorrectionAlternative, ...] = ()
 
 
 class CorrectedTranscript(BaseModel):

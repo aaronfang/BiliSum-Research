@@ -51,6 +51,7 @@ class EvidenceEngine:
                         confidence=confidence,
                         derivation_method="frame_ocr",
                         source_ref=str(frame.path),
+                        media_ref=str(media.path),
                         anchor_id=anchor.anchor_id,
                     )
                 )
