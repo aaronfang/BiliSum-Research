@@ -559,6 +559,7 @@ class ServiceSettings(BaseSettings):
     funasr_hub: str = "ms"
     funasr_hotword: str = ""
     funasr_available: bool = False
+    transcript_fusion_allow_cloud_asr: bool = False
     cuda_variant: str = "cu128"
     runtime_channel: str = "base"
     output_dir: str = ""

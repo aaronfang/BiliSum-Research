@@ -1,0 +1,165 @@
+from video_sum_core.evidence import EvidenceItem, EvidenceKind, EvidenceSet
+from video_sum_core.fusion import CorrectionDecision, FusionEngine
+from video_sum_core.transcript import (
+    Transcript,
+    TranscriptSegment,
+    TranscriptSource,
+    TranscriptSourceKind,
+)
+
+
+def test_reconcile_corrects_technical_token_when_aligned_frame_evidence_supports_it() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            model="local-asr",
+            automatic=True,
+        ),
+        segments=(
+            TranscriptSegment(
+                start=11,
+                end=14,
+                text="My job is to write loops. We call it Loof Engineering.",
+            ),
+        ),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-1",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineering",
+                start=12,
+                end=12,
+                confidence=0.98,
+                derivation_method="frame_ocr",
+                source_ref="frame-1.jpg",
+                anchor_id="anchor-1",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert raw.text.endswith("Loof Engineering.")
+    assert corrected.text.endswith("Loop Engineering.")
+    assert corrected.original is raw
+    assert len(corrected.corrections) == 1
+    assert corrected.corrections[0].from_value == "Loof Engineering"
+    assert corrected.corrections[0].to_value == "Loop Engineering"
+    assert corrected.corrections[0].evidence_ids == ("frame-1",)
+    assert corrected.corrections[0].decision is CorrectionDecision.ACCEPTED
+
+
+def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=11, end=14, text="Loof Engineering"),),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-1",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineering",
+                start=12,
+                end=12,
+                confidence=0.92,
+                derivation_method="frame_ocr",
+                source_ref="frame-1.jpg",
+            ),
+            EvidenceItem(
+                evidence_id="frame-2",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Look Engineering",
+                start=12.5,
+                end=12.5,
+                confidence=0.92,
+                derivation_method="frame_ocr",
+                source_ref="frame-2.jpg",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loof Engineering"
+    assert len(corrected.corrections) == 1
+    assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN
+
+
+def test_reconcile_audits_subtitle_asr_visual_and_context_support_together() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="primary.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=11, end=14, text="Loof Engineering"),),
+    )
+    evidence = EvidenceSet(
+        items=tuple(
+            EvidenceItem(
+                evidence_id=evidence_id,
+                kind=kind,
+                observed_text="Loop Engineering",
+                start=11,
+                end=14,
+                confidence=confidence,
+                derivation_method=kind.value,
+                source_ref=evidence_id,
+            )
+            for evidence_id, kind, confidence in (
+                ("subtitle-1", EvidenceKind.SUBTITLE, 0.97),
+                ("asr-2", EvidenceKind.ASR, 0.74),
+                ("frame-1", EvidenceKind.FRAME_OCR, 0.98),
+                ("context-1", EvidenceKind.CONTEXT, 0.6),
+            )
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loop Engineering"
+    assert corrected.corrections[0].decision is CorrectionDecision.ACCEPTED
+    assert corrected.corrections[0].evidence_ids == (
+        "subtitle-1",
+        "asr-2",
+        "frame-1",
+        "context-1",
+    )
+
+
+def test_reconcile_extracts_technical_candidate_from_a_full_subtitle_sentence() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="primary.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=11, end=14, text="We call it Loof Engineering."),),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="subtitle-1",
+                kind=EvidenceKind.SUBTITLE,
+                observed_text="In this talk we call it Loop Engineering.",
+                start=11,
+                end=14,
+                confidence=0.97,
+                derivation_method="sidecar",
+                source_ref="talk.srt",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "We call it Loop Engineering."
+    assert corrected.corrections[0].evidence_ids == ("subtitle-1",)

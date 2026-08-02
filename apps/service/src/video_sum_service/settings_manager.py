@@ -75,6 +75,7 @@ class SettingsUpdatePayload(BaseModel):
     funasr_spk_model: str | None = None
     funasr_hub: str | None = None
     funasr_hotword: str | None = None
+    transcript_fusion_allow_cloud_asr: bool | None = None
     cuda_variant: str | None = None
     runtime_channel: str | None = None
     output_dir: str | None = None
