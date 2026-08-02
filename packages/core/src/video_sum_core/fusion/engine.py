@@ -11,33 +11,45 @@ from video_sum_core.fusion.models import (
 )
 from video_sum_core.transcript import Transcript, TranscriptSegment
 
+CorrectionProposal = tuple[
+    str,
+    str,
+    list[EvidenceItem],
+    float,
+    CorrectionDecision,
+    tuple[CorrectionAlternative, ...],
+]
+ScoredCandidate = tuple[float, str, str, list[EvidenceItem]]
+
 
 class FusionEngine:
     RULE_VERSION = "technical-token-v1"
+
     def reconcile(self, transcript: Transcript, evidence: EvidenceSet) -> CorrectedTranscript:
         segments = list(transcript.segments)
         corrections: list[Correction] = []
         for segment_index, segment in enumerate(transcript.segments):
             aligned = [item for item in evidence.items if self._overlaps(segment, item)]
-            proposal = self._best_proposal(segment.text, aligned, evidence.context_hints)
-            if proposal is None:
-                continue
-            from_value, to_value, supporting, confidence, decision, alternatives = proposal
-            corrections.append(
-                Correction(
-                    segment_index=segment_index,
-                    from_value=from_value,
-                    to_value=to_value,
-                    evidence_ids=tuple(item.evidence_id for item in supporting),
-                    confidence=confidence,
-                    rule_version=self.RULE_VERSION,
-                    decision=decision,
-                    alternatives=alternatives,
+            segment_text = segment.text
+            for proposal in self._proposals(segment.text, aligned, evidence.context_hints):
+                from_value, to_value, supporting, confidence, decision, alternatives = proposal
+                corrections.append(
+                    Correction(
+                        segment_index=segment_index,
+                        from_value=from_value,
+                        to_value=to_value,
+                        evidence_ids=tuple(item.evidence_id for item in supporting),
+                        confidence=confidence,
+                        rule_version=self.RULE_VERSION,
+                        decision=decision,
+                        alternatives=alternatives,
+                    )
                 )
-            )
-            if decision is CorrectionDecision.ACCEPTED:
+                if decision is CorrectionDecision.ACCEPTED:
+                    segment_text = segment_text.replace(from_value, to_value, 1)
+            if segment_text != segment.text:
                 segments[segment_index] = segment.model_copy(
-                    update={"text": segment.text.replace(from_value, to_value, 1)}
+                    update={"text": segment_text}
                 )
         return CorrectedTranscript(
             original=transcript,
@@ -48,19 +60,12 @@ class FusionEngine:
     def _overlaps(self, segment: TranscriptSegment, item: EvidenceItem) -> bool:
         return item.start <= segment.end and item.end >= segment.start
 
-    def _best_proposal(
+    def _proposals(
         self,
         segment_text: str,
         evidence: list[EvidenceItem],
         context_hints: tuple[str, ...],
-    ) -> tuple[
-        str,
-        str,
-        list[EvidenceItem],
-        float,
-        CorrectionDecision,
-        tuple[CorrectionAlternative, ...],
-    ] | None:
+    ) -> list[CorrectionProposal]:
         grouped: dict[str, list[EvidenceItem]] = defaultdict(list)
         display_value: dict[str, str] = {}
         for item in evidence:
@@ -69,7 +74,7 @@ class FusionEngine:
                 grouped[key].append(item)
                 display_value[key] = candidate
 
-        proposals: list[tuple[float, str, str, list[EvidenceItem]]] = []
+        candidates: list[ScoredCandidate] = []
         for key, supporting in grouped.items():
             candidate = display_value[key]
             match = self._nearest_window(segment_text, candidate)
@@ -82,39 +87,52 @@ class FusionEngine:
             score = round(similarity * 0.55 + evidence_confidence * 0.45, 4)
             if any(candidate.casefold() in hint.casefold() for hint in context_hints):
                 score = min(1.0, round(score + 0.02, 4))
-            proposals.append((score, from_value, candidate, supporting))
+            candidates.append((score, from_value, candidate, supporting))
 
-        if not proposals:
-            return None
-        proposals.sort(key=lambda proposal: proposal[0], reverse=True)
-        score, from_value, candidate, supporting = proposals[0]
-        competing = [
-            proposal
-            for proposal in proposals[1:]
-            if proposal[1].casefold() == from_value.casefold()
-        ]
-        has_visual_support = any(
-            item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
-            for item in supporting
-        )
-        decision = (
-            CorrectionDecision.ACCEPTED
-            if has_visual_support and not competing and score >= 0.88
-            else CorrectionDecision.UNCERTAIN
-        )
-        alternatives = ()
-        if decision is CorrectionDecision.UNCERTAIN:
-            alternatives = tuple(
-                CorrectionAlternative(
-                    value=proposal_candidate,
-                    evidence_ids=tuple(item.evidence_id for item in proposal_supporting),
-                    confidence=proposal_score,
+        by_source: dict[str, list[ScoredCandidate]] = defaultdict(list)
+        for candidate in candidates:
+            by_source[candidate[1].casefold()].append(candidate)
+
+        proposals: list[CorrectionProposal] = []
+        for grouped_candidates in by_source.values():
+            grouped_candidates.sort(key=lambda proposal: proposal[0], reverse=True)
+            score, from_value, candidate, supporting = grouped_candidates[0]
+            competing = grouped_candidates[1:]
+            has_visual_support = any(
+                item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
+                for item in supporting
+            )
+            decision = (
+                CorrectionDecision.ACCEPTED
+                if has_visual_support and not competing and score >= 0.88
+                else CorrectionDecision.UNCERTAIN
+            )
+            alternatives = ()
+            if decision is CorrectionDecision.UNCERTAIN:
+                alternatives = tuple(
+                    CorrectionAlternative(
+                        value=proposal_candidate,
+                        evidence_ids=tuple(item.evidence_id for item in proposal_supporting),
+                        confidence=proposal_score,
+                    )
+                    for proposal_score, _from, proposal_candidate, proposal_supporting in (
+                        grouped_candidates
+                    )
                 )
-                for proposal_score, _proposal_from, proposal_candidate, proposal_supporting in (
-                    [proposals[0], *competing]
+            proposals.append(
+                (
+                    from_value,
+                    candidate,
+                    supporting,
+                    score,
+                    decision,
+                    alternatives,
                 )
             )
-        return from_value, candidate, supporting, score, decision, alternatives
+        return sorted(
+            proposals,
+            key=lambda proposal: segment_text.casefold().find(proposal[0].casefold()),
+        )
 
     def _technical_candidates(self, observed_text: str) -> list[str]:
         candidates: list[str] = []
