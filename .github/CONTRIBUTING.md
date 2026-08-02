@@ -1,6 +1,11 @@
 # 贡献指南
 
-感谢你考虑为 BiliSum 做出贡献！本文档将指导你如何参与项目开发。
+感谢你考虑为 BiliSum Research 做出贡献！本文档将指导你如何参与项目开发。
+
+> 本 fork 的强制交付规则以
+> [`docs/development/delivery-workflow.md`](../docs/development/delivery-workflow.md) 为准：
+> 所有变更必须经过 **Issue → topic branch → PR → required checks/review → merge**，
+> 禁止直接 push、force-push 或绕过保护修改 `master`；Release 只能基于合入后的主干发布。
 
 ---
 
@@ -10,7 +15,7 @@
 
 如果你发现了 bug，请先检查是否已有相关 Issue，然后使用 **Bug 报告模板**创建新 Issue：
 
-1. 访问 [Issues 页面](https://github.com/lycohana/BiliSum/issues/new/choose)
+1. 访问 [Issues 页面](https://github.com/aaronfang/BiliSum-Research/issues/new/choose)
 2. 选择 "🐛 Bug 报告" 模板
 3. 填写完整信息（复现步骤、环境、日志等）
 4. 等待维护者确认
@@ -30,7 +35,8 @@
 
 ⚠️ **PR 前必须先创建 Issue**
 
-所有 PR 必须关联一个已存在的 Issue（除了微小的文档修正）。如果没有相关 Issue，请先创建。
+所有 PR 必须关联并关闭一个已存在的 Issue，文档修正和维护变更也不例外。如果没有相关
+Issue，请先创建。
 
 #### 开发步骤
 
@@ -92,7 +98,7 @@ git commit -m "fix(subtitle): 修复 B站字幕解析空指针异常
 Closes #123"
 ```
 
-6. **Push 到你的 Fork**
+6. **Push topic branch（禁止 push `master`）**
 
 ```bash
 git push origin fix/issue-123-subtitle-error
@@ -340,7 +346,7 @@ PR 提交后会进行代码审查：
 
 ### Q: 我可以直接提 PR 吗？
 
-A: **不可以**。除了微小的文档修正，所有 PR 必须先创建 Issue 讨论。
+A: **不可以**。所有变更（包括文档修正）都必须先创建 Issue。
 
 ### Q: 我的 PR 多久会被审查？
 
@@ -363,7 +369,7 @@ A: 不要气馁！阅读拒绝原因，讨论改进方案，或尝试其他贡�
 
 ## 📞 联系我们
 
-- **GitHub Issues**: https://github.com/lycohana/BiliSum/issues
+- **GitHub Issues**: https://github.com/aaronfang/BiliSum-Research/issues
 - **LinuxDO 社区**: https://linux.do/t/topic/2175871
 
 ---

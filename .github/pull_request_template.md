@@ -3,7 +3,7 @@
 
 
 ## 🔗 相关 Issue
-<!-- 关联相关的 Issue，例如：Closes #123 或 Fixes #456 -->
+<!-- 必须使用 closing keyword；仅写 Related to #123 不满足仓库规则。 -->
 - Closes #
 
 
@@ -53,6 +53,8 @@
 
 
 ## ✅ 检查清单
+- [ ] 本 PR 从关联 Issue 开始，且范围与验收标准一致
+- [ ] 我只 push 了 topic branch，没有直接 push 或绕过保护修改 `master`
 - [ ] 代码遵循项目的编码规范
 - [ ] 我已经进行了自我审查
 - [ ] 我已经添加/更新了相关的注释（特别是复杂逻辑）
@@ -62,6 +64,7 @@
 - [ ] 所有测试通过
 - [ ] Commit 信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)
 - [ ] 我已经在 PR 前创建了相关 Issue
+- [ ] 本 PR 不直接发布版本；Release 只会在本 PR 通过并合入 `master` 后进行
 
 ---
 

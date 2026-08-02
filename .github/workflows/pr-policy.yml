@@ -1,0 +1,35 @@
+name: PR policy
+
+on:
+  pull_request:
+    branches:
+      - master
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  validate-pr-policy:
+    name: validate-pr-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a closing Issue reference
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pull = context.payload.pull_request;
+            const body = pull.body || "";
+            const closingReference = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:[\w.-]+\/[\w.-]+)?#\d+\b/i;
+
+            if (!closingReference.test(body)) {
+              core.setFailed(
+                "PR body must close a GitHub Issue, for example: Closes #123."
+              );
+            }
+
+            if (pull.head.ref === context.payload.repository.default_branch) {
+              core.setFailed("Open the PR from an Issue-scoped topic branch, not master.");
+            }
