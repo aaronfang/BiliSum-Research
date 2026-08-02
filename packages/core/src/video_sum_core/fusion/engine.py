@@ -228,7 +228,34 @@ class FusionEngine:
             start = matches[index].start()
             end = matches[index + word_count - 1].end()
             window = text[start:end]
-            similarity = SequenceMatcher(None, window.casefold(), candidate.casefold()).ratio()
+            similarity = self._technical_similarity(window, candidate)
             if best is None or similarity > best[1]:
                 best = (window, similarity, start, end)
         return best
+
+    def _technical_similarity(self, observed: str, candidate: str) -> float:
+        observed_words = observed.casefold().split()
+        candidate_words = candidate.casefold().split()
+        whole_phrase = SequenceMatcher(
+            None,
+            observed.casefold(),
+            candidate.casefold(),
+        ).ratio()
+        if len(observed_words) != len(candidate_words):
+            return whole_phrase
+
+        word_scores: list[float] = []
+        for observed_word, candidate_word in zip(observed_words, candidate_words, strict=True):
+            if (
+                min(len(observed_word), len(candidate_word)) >= 4
+                and (
+                    observed_word.startswith(candidate_word)
+                    or candidate_word.startswith(observed_word)
+                )
+            ):
+                word_scores.append(1.0)
+            else:
+                word_scores.append(
+                    SequenceMatcher(None, observed_word, candidate_word).ratio()
+                )
+        return max(whole_phrase, sum(word_scores) / len(word_scores))

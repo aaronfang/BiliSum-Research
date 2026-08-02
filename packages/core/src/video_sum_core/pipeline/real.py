@@ -60,7 +60,11 @@ from video_sum_core.evidence import (
     FrameObservation,
     build_visual_evidence_engine,
 )
-from video_sum_core.fusion import FusionEngine, TranscriptFusionWorkflow
+from video_sum_core.fusion import (
+    FusionEngine,
+    TranscriptFusionOutcome,
+    TranscriptFusionWorkflow,
+)
 from video_sum_core.twelvelabs import (
     DEFAULT_TWELVELABS_PROMPT,
     analyze_video_with_pegasus,
@@ -525,6 +529,52 @@ class RealPipelineRunner(PipelineRunner):
             context.task_input.source,
             context.task_input.title,
         )
+        raw_transcript = transcript
+        raw_segments = segments
+        fusion_outcome = None
+        media_source_path = self._parse_reused_media_source(context.task_input.source)
+        if (
+            not source_kind
+            and self._settings.transcript_fusion_enabled
+            and media_source_path is not None
+            and media_source_path.is_file()
+            and media_source_path.suffix.lower() not in _AUDIO_EXTENSIONS
+        ):
+            media = MediaSource(path=media_source_path)
+            primary = transcript_from_legacy(
+                transcript,
+                segments,
+                self._parse_reused_transcript_source(
+                    context.task_input.source,
+                    media_source_path,
+                ),
+            )
+            workflow = TranscriptFusionWorkflow(
+                resolver=self._transcript_resolver or TranscriptResolver(),
+                asr_adapter=self._asr_adapter,
+                fusion_engine=self._fusion_engine,
+            )
+            fusion_outcome = workflow.reconcile(
+                media,
+                primary,
+                title=title,
+                fusion_enabled=True,
+                evidence_budget=EvidenceBudget(
+                    max_frames=self._settings.visual_evidence_max_frames
+                ),
+                evidence_engine_factory=lambda resolved: self._evidence_engine
+                or self._build_default_correction_evidence_engine(
+                    media=media,
+                    transcript=resolved,
+                    title=title,
+                    evidence_dir=task_dir / "correction_evidence",
+                ),
+            )
+            segments = [
+                segment.model_dump(mode="json")
+                for segment in fusion_outcome.corrected.segments
+            ]
+            transcript = self._render_transcript_from_segments(segments)
         is_aggregate_series = source_kind == "aggregate_series"
         emit(
             "preparing",
@@ -547,7 +597,29 @@ class RealPipelineRunner(PipelineRunner):
             prompt_preset_id=context.task_input.options.prompt_preset_id,
         )
         emit("exporting", 97, "正在导出新的摘要结果")
-        result = self._export_result(task_dir, title, transcript, segments, summary)
+        result = self._export_result(
+            task_dir,
+            title,
+            transcript,
+            segments,
+            summary,
+            raw_transcript=raw_transcript,
+            raw_segments=raw_segments,
+        )
+        if fusion_outcome is not None:
+            result = result.model_copy(
+                update={
+                    "artifacts": {
+                        **result.artifacts,
+                        **self._export_fusion_artifacts(
+                            task_dir,
+                            transcript,
+                            raw_segments,
+                            fusion_outcome,
+                        ),
+                    }
+                }
+            )
         emit(
             "exporting",
             98,
@@ -684,16 +756,12 @@ class RealPipelineRunner(PipelineRunner):
         )
         correction_artifacts: dict[str, str] = {}
         if self._settings.transcript_fusion_enabled:
-            raw_transcript_path = task_dir / "transcript.txt"
-            corrected_transcript_path = task_dir / "corrected_transcript.txt"
-            correction_audit_path = task_dir / "correction_audit.json"
-            corrected_transcript_path.write_text(transcript, encoding="utf-8")
-            self._write_json_atomic(correction_audit_path, outcome.audit_payload())
-            correction_artifacts = {
-                "raw_transcript_path": str(raw_transcript_path),
-                "corrected_transcript_path": str(corrected_transcript_path),
-                "correction_audit_path": str(correction_audit_path),
-            }
+            correction_artifacts = self._export_fusion_artifacts(
+                task_dir,
+                transcript,
+                raw_segments,
+                outcome,
+            )
         result = result.model_copy(
             update={
                 "artifacts": {
@@ -724,6 +792,30 @@ class RealPipelineRunner(PipelineRunner):
             task_dir,
         )
         return result
+
+    def _export_fusion_artifacts(
+        self,
+        task_dir: Path,
+        corrected_transcript: str,
+        raw_segments: list[dict[str, object]],
+        outcome: TranscriptFusionOutcome,
+    ) -> dict[str, str]:
+        raw_transcript_path = task_dir / "transcript.txt"
+        raw_segments_path = task_dir / "raw_segments.json"
+        corrected_transcript_path = task_dir / "corrected_transcript.txt"
+        correction_audit_path = task_dir / "correction_audit.json"
+        provenance_path = task_dir / "transcript_provenance.json"
+        self._write_json_atomic(raw_segments_path, raw_segments)
+        corrected_transcript_path.write_text(corrected_transcript, encoding="utf-8")
+        self._write_json_atomic(correction_audit_path, outcome.audit_payload())
+        self._write_json_atomic(provenance_path, outcome.provenance_payload())
+        return {
+            "raw_transcript_path": str(raw_transcript_path),
+            "raw_segments_path": str(raw_segments_path),
+            "corrected_transcript_path": str(corrected_transcript_path),
+            "correction_audit_path": str(correction_audit_path),
+            "transcript_provenance_path": str(provenance_path),
+        }
 
     def _can_collect_supporting_asr(self) -> bool:
         if self._asr_adapter is not None:
@@ -902,6 +994,37 @@ class RealPipelineRunner(PipelineRunner):
         title = str(payload.get("title") or title_hint or "视频摘要").strip() or "视频摘要"
         source_kind = str(payload.get("source_kind") or "").strip() or None
         return title, transcript, segments, source_kind
+
+    def _parse_reused_media_source(self, source: object) -> Path | None:
+        try:
+            payload = json.loads(str(source or ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        media_source = str(payload.get("media_source") or "").strip()
+        return Path(media_source).expanduser() if media_source else None
+
+    def _parse_reused_transcript_source(
+        self,
+        source: object,
+        media_source_path: Path,
+    ) -> TranscriptSource:
+        try:
+            payload = json.loads(str(source or ""))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("transcript_source"), dict):
+            try:
+                return TranscriptSource.model_validate(payload["transcript_source"])
+            except ValueError:
+                pass
+        return TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location=str(media_source_path),
+            automatic=True,
+            fallback_reason="reused legacy transcript for resummary",
+        )
 
     def _coerce_transcript_segments(self, value: object) -> list[dict[str, object]]:
         if not isinstance(value, list):

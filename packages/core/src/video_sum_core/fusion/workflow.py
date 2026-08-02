@@ -53,7 +53,7 @@ class TranscriptFusionWorkflow:
     def __init__(
         self,
         resolver: TranscriptResolver,
-        asr_adapter: AsrAdapter,
+        asr_adapter: AsrAdapter | None,
         fusion_engine: FusionEngine | None = None,
         anchor_planner: TextAnchorPlanner | None = None,
     ) -> None:
@@ -79,6 +79,7 @@ class TranscriptFusionWorkflow:
         if (
             fusion_enabled
             and collect_supporting_asr
+            and self._asr_adapter is not None
             and primary.source.kind is not TranscriptSourceKind.ASR
         ):
             try:
@@ -86,14 +87,37 @@ class TranscriptFusionWorkflow:
             except VideoSumError as exc:
                 warnings.append(str(exc))
 
+        return self.reconcile(
+            media,
+            primary,
+            title=title,
+            fusion_enabled=fusion_enabled,
+            evidence_budget=evidence_budget,
+            evidence_engine_factory=evidence_engine_factory,
+            supporting=tuple(supporting),
+            warnings=tuple(warnings),
+        )
+
+    def reconcile(
+        self,
+        media: MediaSource,
+        primary: Transcript,
+        *,
+        title: str,
+        fusion_enabled: bool,
+        evidence_budget: EvidenceBudget,
+        evidence_engine_factory: Callable[[Transcript], EvidenceEngine | None],
+        supporting: tuple[Transcript, ...] = (),
+        warnings: tuple[str, ...] = (),
+    ) -> TranscriptFusionOutcome:
         if not fusion_enabled:
             evidence = EvidenceSet()
             return TranscriptFusionOutcome(
                 primary=primary,
-                supporting=tuple(supporting),
+                supporting=supporting,
                 corrected=self._fusion_engine.reconcile(primary, evidence),
                 evidence=evidence,
-                warnings=tuple(warnings),
+                warnings=warnings,
             )
 
         anchors = self._anchor_planner.plan(primary)
@@ -127,8 +151,8 @@ class TranscriptFusionWorkflow:
         )
         return TranscriptFusionOutcome(
             primary=primary,
-            supporting=tuple(supporting),
+            supporting=supporting,
             corrected=self._fusion_engine.reconcile(primary, evidence),
             evidence=evidence,
-            warnings=tuple(warnings),
+            warnings=warnings,
         )

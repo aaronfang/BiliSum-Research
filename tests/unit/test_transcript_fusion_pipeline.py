@@ -32,7 +32,7 @@ class LoofAsrResolver:
 
 class LoopVisualEvidenceEngine:
     def collect(self, media: MediaSource, anchors: list[TextAnchor], budget) -> EvidenceSet:
-        assert any(anchor.query == "Loof Engineering" for anchor in anchors)
+        assert any(anchor.query in {"Loof Engineering", "Loof Engine"} for anchor in anchors)
         return EvidenceSet(
             items=(
                 EvidenceItem(
@@ -127,6 +127,10 @@ def test_local_media_run_uses_corrected_transcript_and_exports_audit(tmp_path: P
     assert "Loof Engineering" in Path(result.artifacts["raw_transcript_path"]).read_text(
         encoding="utf-8"
     )
+    raw_segments = json.loads(
+        Path(result.artifacts["raw_segments_path"]).read_text(encoding="utf-8")
+    )
+    assert raw_segments[0]["text"] == "We call it Loof Engineering."
     assert "Loop Engineering" in Path(result.artifacts["corrected_transcript_path"]).read_text(
         encoding="utf-8"
     )
@@ -136,6 +140,75 @@ def test_local_media_run_uses_corrected_transcript_and_exports_audit(tmp_path: P
     assert audit["corrections"][0]["decision"] == "accepted"
     assert audit["corrections"][0]["evidence_ids"] == ["frame-1"]
     assert audit["context_hints"] == ["Loop Engineering"]
+
+
+def test_transcript_rerun_reconciles_reused_text_against_its_source_media(
+    tmp_path: Path,
+) -> None:
+    media_path = tmp_path / "loop-engineering.mp4"
+    media_path.write_bytes(b"the injected evidence engine does not decode this")
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path / "tasks",
+            llm_enabled=False,
+            transcript_fusion_enabled=True,
+        ),
+        evidence_engine=LoopVisualEvidenceEngine(),
+    )
+    payload = json.dumps(
+        {
+            "title": "Loop Engineering",
+            "transcript": "[00:11] We call it Loof Engine.",
+            "segments": [
+                {
+                    "start": 11,
+                    "end": 14,
+                    "text": "We call it Loof Engine.",
+                }
+            ],
+            "media_source": str(media_path),
+            "transcript_source": {
+                "kind": "sidecar",
+                "location": str(media_path.with_suffix(".srt")),
+                "format": "srt",
+                "language": "en",
+                "automatic": False,
+            },
+        }
+    )
+
+    _events, result = runner.run(
+        PipelineContext(
+            task_id="task-rerun-fusion",
+            task_input={
+                "input_type": InputType.TRANSCRIPT_TEXT,
+                "source": payload,
+                "title": "Loop Engineering",
+            },
+        )
+    )
+
+    assert "Loop Engineering" in result.transcript_text
+    assert "Loof Engine" not in result.transcript_text
+    assert "Loof Engine" in Path(result.artifacts["raw_transcript_path"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Loop Engineering" in Path(
+        result.artifacts["corrected_transcript_path"]
+    ).read_text(encoding="utf-8")
+    audit = json.loads(
+        Path(result.artifacts["correction_audit_path"]).read_text(encoding="utf-8")
+    )
+    assert audit["corrections"][0]["decision"] == "accepted"
+    assert audit["primary_source"] == {
+        "kind": "sidecar",
+        "location": str(media_path.with_suffix(".srt")),
+        "format": "srt",
+        "language": "en",
+        "model": None,
+        "automatic": False,
+        "fallback_reason": None,
+    }
 
 
 def test_local_media_fusion_combines_sidecar_asr_and_visual_evidence(tmp_path: Path) -> None:
