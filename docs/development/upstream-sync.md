@@ -11,16 +11,23 @@ upstream  https://github.com/lycohana/BiliSum.git
 
 ## Sync Procedure
 
-Perform synchronization on a clean working tree:
+Perform synchronization on a clean working tree through an Issue-scoped branch and PR:
 
 ```bash
 git fetch upstream
 git switch master
-git merge --ff-only upstream/master
-git push origin master
+git pull --ff-only origin master
+git switch -c chore/issue-<number>-upstream-sync
+git merge upstream/master
+git push -u origin chore/issue-<number>-upstream-sync
+gh pr create --base master --head chore/issue-<number>-upstream-sync \
+  --title "chore(upstream): sync upstream master" \
+  --body "Closes #<number>"
 ```
 
-If the fork has diverged, create a dedicated sync branch and merge normally after tests. Do not force-push `master` to hide divergence.
+Do not push, force-push, or merge upstream directly into remote `master`. Resolve divergence on
+the sync branch, run the required checks, and merge only after the PR is green and approved. See
+`docs/development/delivery-workflow.md` for the repository-wide policy.
 
 ## Conflict Reduction
 

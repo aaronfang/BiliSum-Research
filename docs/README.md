@@ -12,6 +12,7 @@ This documentation is the build contract for evolving the BiliSum fork into a lo
 4. [MVP Specification](specs/mvp.md) defines the first usable delivery and acceptance criteria.
 5. [Implementation Roadmap](roadmap.md) orders the work by dependency.
 6. [Development Setup](development/getting-started.md) describes the current upstream setup and the proposed local stack.
+7. [Delivery Workflow](development/delivery-workflow.md) defines Issue, branch, commit, PR, merge, push, and release rules.
 
 ## Decisions
 
