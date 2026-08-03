@@ -15,7 +15,8 @@ from video_sum_core.transcript.models import (
 
 
 class AsrAdapter(Protocol):
-    def transcribe(self, source: MediaSource) -> Transcript: ...
+    def transcribe(self, source: MediaSource) -> Transcript:
+        raise NotImplementedError
 
 
 class CallableAsrAdapter:

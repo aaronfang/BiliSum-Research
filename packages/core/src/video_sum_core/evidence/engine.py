@@ -13,11 +13,13 @@ from video_sum_core.transcript import MediaSource
 
 
 class FrameExtractor(Protocol):
-    def extract(self, media: MediaSource, timestamps: list[float]) -> list[FrameSample]: ...
+    def extract(self, media: MediaSource, timestamps: list[float]) -> list[FrameSample]:
+        raise NotImplementedError
 
 
 class FrameTextReader(Protocol):
-    def read(self, frame: FrameSample) -> FrameObservation: ...
+    def read(self, frame: FrameSample) -> FrameObservation:
+        raise NotImplementedError
 
 
 class EvidenceEngine:
