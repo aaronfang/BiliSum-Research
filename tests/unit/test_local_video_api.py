@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -196,7 +197,7 @@ def test_create_video_tasks_batch_requires_confirmation_for_completed_pages() ->
 
 
 def test_create_video_resummary_tasks_batch_creates_new_tasks_after_confirmation(
-    monkeypatch,
+    tmp_path: Path,
 ) -> None:
     repository = create_repository()
     worker = FakeTaskWorker()
@@ -212,13 +213,51 @@ def test_create_video_resummary_tasks_batch_creates_new_tasks_after_confirmation
             ],
         )
     )
-    append_completed_page_task(repository, asset.video_id, 1, "P1 开场")
+    source_task_id = append_completed_page_task(repository, asset.video_id, 1, "P1 开场")
+    summary_path = tmp_path / "summary.json"
+    raw_transcript_path = tmp_path / "transcript.txt"
+    raw_segments_path = tmp_path / "raw_segments.json"
+    provenance_path = tmp_path / "transcript_provenance.json"
+    summary_path.write_text(
+        json.dumps({"segments": [{"start": 0, "end": 1, "text": "Loop Engineering"}]}),
+        encoding="utf-8",
+    )
+    raw_transcript_path.write_text("[00:00] Loof Engineering", encoding="utf-8")
+    raw_segments_path.write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "Loof Engineering"}]),
+        encoding="utf-8",
+    )
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "primary": {
+                    "kind": "sidecar",
+                    "location": "/tmp/source.srt",
+                    "format": "srt",
+                    "language": "en",
+                    "automatic": False,
+                },
+                "supporting": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    repository.save_result(
+        source_task_id,
+        TaskResult(
+            transcript_text="[00:00] Loop Engineering",
+            segments=[{"start": 0, "end": 1, "text": "Loop Engineering"}],
+            artifacts={
+                "summary_path": str(summary_path),
+                "raw_transcript_path": str(raw_transcript_path),
+                "raw_segments_path": str(raw_segments_path),
+                "transcript_provenance_path": str(provenance_path),
+            },
+        ),
+    )
     app.state.task_repository = repository
     app.state.task_worker = worker
-    monkeypatch.setattr(
-        "video_sum_service.routers.videos.load_task_segments",
-        lambda _path: [{"start": 0, "text": "hello"}],
-    )
 
     preview = create_video_resummary_tasks_batch(
         asset.video_id,
@@ -240,6 +279,13 @@ def test_create_video_resummary_tasks_batch_creates_new_tasks_after_confirmation
     assert len(confirmed.skipped_pages) == 1
     assert confirmed.skipped_pages[0].page_number == 2
     assert worker.submitted[-1].task_input.input_type is InputType.TRANSCRIPT_TEXT
+    payload = json.loads(worker.submitted[-1].task_input.source)
+    assert payload["media_source"] == asset.source_url
+    assert payload["transcript"] == "[00:00] Loof Engineering"
+    assert payload["segments"] == [
+        {"start": 0, "end": 1, "text": "Loof Engineering"}
+    ]
+    assert payload["transcript_source"]["kind"] == "sidecar"
 
 
 def test_create_video_aggregate_summary_uses_only_completed_pages_by_default() -> None:

@@ -582,6 +582,56 @@ def test_run_from_local_video_file_uses_local_media_pipeline(monkeypatch: pytest
     assert any("本地视频文件" in message for _, _, message, _ in emitted)
 
 
+def test_run_from_local_video_with_sidecar_skips_audio_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+    local_video = tmp_path / "sample.mp4"
+    local_video.write_bytes(b"fake-video")
+    (tmp_path / "sample.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n字幕优先\n",
+        encoding="utf-8",
+    )
+
+    def fail_audio_preparation(*_args, **_kwargs):
+        pytest.fail("valid sidecar subtitles must not require audio preparation")
+
+    monkeypatch.setattr(runner, "_prepare_local_audio_source", fail_audio_preparation)
+    monkeypatch.setattr(
+        runner,
+        "_summarize",
+        lambda *_args, **_kwargs: {
+            "overview": "本地概览",
+            "knowledgeNoteMarkdown": "# 本地笔记",
+            "bulletPoints": [],
+            "chapters": [],
+            "chapterGroups": [],
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_export_result",
+        lambda *_args, **_kwargs: runner._build_task_result(
+            "字幕优先",
+            {"overview": "本地概览", "knowledgeNoteMarkdown": "# 本地笔记"},
+        ),
+    )
+
+    _events, result = runner.run(
+        PipelineContext(
+            task_id="task-local-video-sidecar",
+            task_input={
+                "input_type": InputType.VIDEO_FILE,
+                "source": str(local_video),
+                "title": "本地示例视频",
+            },
+        )
+    )
+
+    assert result.transcript_text == "字幕优先"
+
+
 def test_run_from_url_rejects_unsupported_url(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
 
@@ -717,6 +767,58 @@ def test_preflight_llm_timeout_fails_quickly(monkeypatch: pytest.MonkeyPatch, tm
 
     with pytest.raises(VideoSumError, match="LLM API 检查超时"):
         runner._preflight_llm_availability()
+
+
+def test_preflight_allows_reasoning_models_to_reach_message_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="http://127.0.0.1:11434/v1",
+            llm_model="qwen3:14b",
+        )
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, max_tokens: int) -> None:
+            self.max_tokens = max_tokens
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            content = '{"ok":true}' if self.max_tokens >= 256 else ""
+            return {
+                "choices": [
+                    {
+                        "message": {"content": content, "reasoning": "model reasoning"},
+                        "finish_reason": "stop" if content else "length",
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            return FakeResponse(int(json.get("max_tokens") or 0))
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.httpx.Client", FakeClient)
+
+    runner._preflight_llm_availability()
 
 
 def test_llm_json_request_normalizes_mimo_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1090,6 +1192,86 @@ def test_visual_vlm_integrated_mode_uses_observations(tmp_path: Path, monkeypatc
     assert "模型解析的结构图" in markdown
     assert "这张结构图说明任务链如何串联。" in markdown
     assert "visual://f0001" in markdown
+
+
+def test_visual_frame_description_accepts_ollama_json_in_reasoning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            visual_evidence_api_key="ollama",
+            visual_evidence_base_url="http://127.0.0.1:11434/v1",
+            visual_evidence_model="qwen3-vl:8b",
+        )
+    )
+    image_path = tmp_path / "frame.jpg"
+    image_path.write_bytes(b"jpeg")
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning": json.dumps(
+                                {
+                                    "visual_type": "code",
+                                    "caption": "Loop Engineering",
+                                    "ocr_text": "Loop Engineering",
+                                    "key_facts": ["Loop Engineering"],
+                                    "semantic_summary": "画面包含 Loop Engineering。",
+                                    "should_insert": True,
+                                    "confidence": 0.98,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append(json)
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.httpx.Client", FakeClient)
+
+    observations = runner._describe_visual_frames(
+        [
+            {
+                "frame_id": "f0001",
+                "timestamp_seconds": 12.0,
+                "timestamp": "00:12",
+                "_analysis_absolute_path": str(image_path),
+            }
+        ],
+        "测试视频",
+        TaskResult(timeline=[]),
+    )
+
+    assert observations[0]["ocr_text"] == "Loop Engineering"
+    assert observations[0]["caption"] == "Loop Engineering"
+    assert calls[0]["reasoning_effort"] == "none"
 
 
 def test_visual_keyframe_plan_prefers_llm_selected_timestamps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

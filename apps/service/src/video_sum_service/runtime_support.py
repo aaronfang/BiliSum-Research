@@ -1978,6 +1978,14 @@ def build_worker(
         "llm_api_key": runtime_settings.llm_api_key,
         "llm_base_url": runtime_settings.llm_base_url,
         "llm_model": runtime_settings.llm_model,
+        "transcript_fusion_enabled": bool(
+            runtime_settings.visual_evidence_enabled
+            and runtime_settings.visual_multimodal_enabled
+            and runtime_settings.visual_evidence_use_llm
+        ),
+        "transcript_fusion_allow_cloud_asr": (
+            runtime_settings.transcript_fusion_allow_cloud_asr
+        ),
         "visual_evidence_enabled": runtime_settings.visual_evidence_enabled,
         "visual_note_mode": runtime_settings.visual_note_mode,
         "visual_multimodal_enabled": runtime_settings.visual_multimodal_enabled,

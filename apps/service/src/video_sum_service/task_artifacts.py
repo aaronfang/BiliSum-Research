@@ -97,6 +97,38 @@ def load_task_segments(summary_path: str) -> list[dict[str, object]]:
     return segments
 
 
+def load_reusable_transcript(
+    result: Any,
+) -> tuple[str, list[dict[str, object]], dict[str, object] | None]:
+    artifacts = getattr(result, "artifacts", {}) or {}
+    transcript = str(getattr(result, "transcript_text", "") or "").strip()
+    segments = load_task_segments(str(artifacts.get("summary_path") or ""))
+
+    raw_transcript_path = artifacts.get("raw_transcript_path")
+    if raw_transcript_path:
+        try:
+            raw_transcript = Path(str(raw_transcript_path)).read_text(encoding="utf-8").strip()
+        except OSError:
+            raw_transcript = ""
+        if raw_transcript:
+            transcript = raw_transcript
+
+    raw_segments_path = artifacts.get("raw_segments_path")
+    if raw_segments_path:
+        raw_segments = _read_optional_json(Path(str(raw_segments_path)))
+        if isinstance(raw_segments, list) and raw_segments:
+            segments = [item for item in raw_segments if isinstance(item, dict)]
+
+    transcript_source = None
+    provenance_path = artifacts.get("transcript_provenance_path")
+    if provenance_path:
+        provenance = _read_optional_json(Path(str(provenance_path)))
+        primary = provenance.get("primary") if isinstance(provenance, dict) else None
+        if isinstance(primary, dict):
+            transcript_source = primary
+    return transcript, segments, transcript_source
+
+
 def load_task_mindmap(mindmap_path: str) -> TaskMindMap:
     try:
         payload = json.loads(Path(mindmap_path).read_text(encoding="utf-8"))
@@ -244,12 +276,12 @@ def _safe_visual_frame_target(visual_dir: Path, file_name: str) -> Path | None:
     return target
 
 
-def _read_optional_json(path: Path) -> dict[str, object]:
+def _read_optional_json(path: Path) -> object | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        return None
+    return payload
 
 
 def load_visual_insert_plan(visual_insert_plan_path: str | None) -> dict[str, object] | None:
