@@ -104,6 +104,38 @@ def test_reconcile_corrects_multiple_independent_tokens_in_one_segment() -> None
     }
 
 
+def test_reconcile_replaces_a_malformed_url_as_a_complete_span() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=1, end=2, text="打开 htp://example.com/docs。"),),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-url",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="https://example.com/docs",
+                start=1.5,
+                end=1.5,
+                confidence=0.98,
+                derivation_method="frame_ocr",
+                source_ref="frame-url.jpg",
+                media_ref="video.mp4",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "打开 https://example.com/docs。"
+    assert corrected.corrections[0].from_value == "htp://example.com/docs"
+    assert corrected.corrections[0].to_value == "https://example.com/docs"
+
+
 def test_reconcile_does_not_audit_overlapping_noop_corrections() -> None:
     raw = Transcript(
         source=TranscriptSource(

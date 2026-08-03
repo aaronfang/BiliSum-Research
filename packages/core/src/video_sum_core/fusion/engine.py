@@ -282,6 +282,8 @@ class FusionEngine:
         text: str,
         candidate: str,
     ) -> tuple[str, float, int, int] | None:
+        if candidate.casefold().startswith(("http://", "https://")):
+            return self._nearest_url_window(text, candidate)
         word_count = len(candidate.split())
         token_pattern = r"[A-Za-z0-9_+/#-]+(?:\.[A-Za-z0-9_+/#-]+)*"
         matches = list(re.finditer(token_pattern, text))
@@ -292,6 +294,24 @@ class FusionEngine:
             start = matches[index].start()
             end = matches[index + word_count - 1].end()
             window = text[start:end]
+            similarity = self._technical_similarity(window, candidate)
+            if best is None or similarity > best[1]:
+                best = (window, similarity, start, end)
+        return best
+
+    def _nearest_url_window(
+        self,
+        text: str,
+        candidate: str,
+    ) -> tuple[str, float, int, int] | None:
+        url_pattern = r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+"
+        best: tuple[str, float, int, int] | None = None
+        for match in re.finditer(url_pattern, text):
+            start = match.start()
+            window = match.group(0).rstrip(".,;:!?)]}\"'，。！？；：、…")
+            if not window:
+                continue
+            end = start + len(window)
             similarity = self._technical_similarity(window, candidate)
             if best is None or similarity > best[1]:
                 best = (window, similarity, start, end)
