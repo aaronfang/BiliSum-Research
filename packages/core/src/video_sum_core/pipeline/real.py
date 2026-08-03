@@ -2993,6 +2993,21 @@ class RealPipelineRunner(PipelineRunner):
         content = extract_llm_message_content(response_json)
         if content:
             return content
+        choices = response_json.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                for key in ("reasoning", "reasoning_content"):
+                    reasoning = message.get(key)
+                    if not isinstance(reasoning, str) or not reasoning.strip():
+                        continue
+                    candidate = _extract_json_object_text(reasoning)
+                    try:
+                        parsed = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(parsed, dict):
+                        return candidate
         raise VideoSumError("LLM returned no readable message content.")
 
     def _preflight_llm_availability(self) -> None:
@@ -3013,7 +3028,9 @@ class RealPipelineRunner(PipelineRunner):
                 },
             ],
             "temperature": 0,
-            "max_tokens": 32,
+            # Some reasoning models consume their initial output budget before
+            # emitting message.content, even when thinking-disable hints are ignored.
+            "max_tokens": 512,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -4237,6 +4254,8 @@ P 数索引：
                 ],
                 "response_format": {"type": "json_object"},
                 "enable_thinking": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "reasoning_effort": "none",
             }
             # Only use Anthropic image format for the real Anthropic API.
             # Third-party Anthropic-compatible endpoints (e.g. SiliconFlow) do not
@@ -4258,7 +4277,7 @@ P 数索引：
                         response = client.post(request_url, headers=headers, json=request_payload)
                     response.raise_for_status()
                     body = response.json()
-                    content = extract_llm_message_content(body)
+                    content = self._extract_llm_response_content(body)
                     parsed = json.loads(_extract_json_object_text(content))
                     key_facts_raw = parsed.get("key_facts")
                     key_facts: list[str] = []
