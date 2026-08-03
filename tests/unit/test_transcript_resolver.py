@@ -84,3 +84,21 @@ def test_resolve_reads_same_stem_webvtt_when_srt_is_absent(tmp_path: Path) -> No
     assert transcript.source.format == "vtt"
     assert transcript.segments[0].start == 11.0
     assert transcript.segments[0].end == 14.5
+
+
+def test_resolve_tries_webvtt_when_same_stem_srt_is_invalid(tmp_path: Path) -> None:
+    media_path = tmp_path / "loop-engineering.mp4"
+    media_path.write_bytes(b"video")
+    (tmp_path / "loop-engineering.srt").write_text("not timed text", encoding="utf-8")
+    sidecar_path = tmp_path / "loop-engineering.vtt"
+    sidecar_path.write_text(
+        "WEBVTT\n\n00:11.000 --> 00:14.500\nLoop Engineering\n",
+        encoding="utf-8",
+    )
+
+    transcript = TranscriptResolver(asr_adapter=UnexpectedAsrAdapter()).resolve(
+        MediaSource(path=media_path),
+        TranscriptPolicy(prefer_subtitles=True),
+    )
+
+    assert transcript.source.location == str(sidecar_path)

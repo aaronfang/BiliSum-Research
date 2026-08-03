@@ -660,18 +660,25 @@ class RealPipelineRunner(PipelineRunner):
             "正在读取本地视频文件" if is_video_file else "正在读取本地音频文件",
             {"path": str(source_path)},
         )
-        audio_path = self._prepare_local_audio_source(
-            source_path=source_path,
-            task_dir=task_dir,
-            safe_title=safe_title,
-            input_type=task_input.input_type,
-            emit=emit,
-        )
+        audio_path: Path | None = None
+
+        def ensure_audio_path() -> Path:
+            nonlocal audio_path
+            if audio_path is None:
+                audio_path = self._prepare_local_audio_source(
+                    source_path=source_path,
+                    task_dir=task_dir,
+                    safe_title=safe_title,
+                    input_type=task_input.input_type,
+                    emit=emit,
+                )
+            return audio_path
+
         media = MediaSource(path=source_path)
         asr_adapter = self._asr_adapter or CallableAsrAdapter(
             lambda requested_media: self._run_local_asr(
                 media=requested_media,
-                audio_path=audio_path,
+                audio_path=ensure_audio_path(),
                 emit=emit,
             )
         )

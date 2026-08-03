@@ -582,6 +582,56 @@ def test_run_from_local_video_file_uses_local_media_pipeline(monkeypatch: pytest
     assert any("本地视频文件" in message for _, _, message, _ in emitted)
 
 
+def test_run_from_local_video_with_sidecar_skips_audio_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+    local_video = tmp_path / "sample.mp4"
+    local_video.write_bytes(b"fake-video")
+    (tmp_path / "sample.srt").write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n字幕优先\n",
+        encoding="utf-8",
+    )
+
+    def fail_audio_preparation(*_args, **_kwargs):
+        pytest.fail("valid sidecar subtitles must not require audio preparation")
+
+    monkeypatch.setattr(runner, "_prepare_local_audio_source", fail_audio_preparation)
+    monkeypatch.setattr(
+        runner,
+        "_summarize",
+        lambda *_args, **_kwargs: {
+            "overview": "本地概览",
+            "knowledgeNoteMarkdown": "# 本地笔记",
+            "bulletPoints": [],
+            "chapters": [],
+            "chapterGroups": [],
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_export_result",
+        lambda *_args, **_kwargs: runner._build_task_result(
+            "字幕优先",
+            {"overview": "本地概览", "knowledgeNoteMarkdown": "# 本地笔记"},
+        ),
+    )
+
+    _events, result = runner.run(
+        PipelineContext(
+            task_id="task-local-video-sidecar",
+            task_input={
+                "input_type": InputType.VIDEO_FILE,
+                "source": str(local_video),
+                "title": "本地示例视频",
+            },
+        )
+    )
+
+    assert result.transcript_text == "字幕优先"
+
+
 def test_run_from_url_rejects_unsupported_url(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
 

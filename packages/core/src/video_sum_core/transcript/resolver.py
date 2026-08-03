@@ -33,13 +33,15 @@ class TranscriptResolver:
     def resolve(self, source: MediaSource, policy: TranscriptPolicy) -> Transcript:
         fallback_reason = "subtitle preference disabled"
         if policy.prefer_subtitles:
-            sidecar = self._find_sidecar(source.path)
-            if sidecar is not None:
+            sidecars = self._find_sidecars(source.path)
+            if sidecars:
+                fallback_reason = "no accepted sidecar subtitle"
+            for sidecar in sidecars:
                 try:
                     return self._read_sidecar(sidecar)
                 except VideoSumError as exc:
                     fallback_reason = str(exc)
-            else:
+            if not sidecars:
                 fallback_reason = "no accepted sidecar subtitle"
         if self._asr_adapter is None:
             raise VideoSumError(f"No accepted subtitle or ASR adapter for media: {source.path}")
@@ -52,12 +54,12 @@ class TranscriptResolver:
             }
         )
 
-    def _find_sidecar(self, media_path: Path) -> Path | None:
-        for suffix in (".srt", ".vtt"):
-            candidate = media_path.with_suffix(suffix)
-            if candidate.is_file():
-                return candidate
-        return None
+    def _find_sidecars(self, media_path: Path) -> list[Path]:
+        return [
+            candidate
+            for suffix in (".srt", ".vtt")
+            if (candidate := media_path.with_suffix(suffix)).is_file()
+        ]
 
     def _read_sidecar(self, path: Path) -> Transcript:
         text = path.read_text(encoding="utf-8-sig")
