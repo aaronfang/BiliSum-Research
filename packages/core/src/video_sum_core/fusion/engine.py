@@ -36,7 +36,7 @@ class _CorrectionProposal:
 
 
 class FusionEngine:
-    RULE_VERSION = "technical-token-v1"
+    RULE_VERSION = "technical-token-v2"
 
     def reconcile(self, transcript: Transcript, evidence: EvidenceSet) -> CorrectedTranscript:
         segments = list(transcript.segments)
@@ -132,13 +132,11 @@ class FusionEngine:
 
         proposals: list[_CorrectionProposal] = []
         for grouped_candidates in by_source.values():
+            grouped_candidates = self._merge_truncated_candidates(grouped_candidates)
             grouped_candidates.sort(key=lambda proposal: proposal.score, reverse=True)
             winner = grouped_candidates[0]
             competing = grouped_candidates[1:]
-            has_visual_support = any(
-                item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
-                for item in winner.supporting
-            )
+            has_visual_support = self._has_qualifying_visual_support(winner)
             decision = (
                 CorrectionDecision.ACCEPTED
                 if has_visual_support and not competing and winner.score >= 0.88
@@ -180,6 +178,72 @@ class FusionEngine:
                 continue
             selected.append(proposal)
         return sorted(selected, key=lambda proposal: proposal.start)
+
+    def _merge_truncated_candidates(
+        self,
+        candidates: list[_ScoredCandidate],
+    ) -> list[_ScoredCandidate]:
+        merged: list[_ScoredCandidate] = []
+        for candidate in sorted(
+            candidates,
+            key=lambda item: len(item.to_value),
+            reverse=True,
+        ):
+            longer_candidate = next(
+                (
+                    item
+                    for item in merged
+                    if self._is_truncated_variant(candidate.to_value, item.to_value)
+                    and self._has_qualifying_visual_support(candidate)
+                    and self._has_qualifying_visual_support(item)
+                ),
+                None,
+            )
+            if longer_candidate is None:
+                merged.append(candidate)
+                continue
+            supporting_by_id = {
+                item.evidence_id: item
+                for item in (*longer_candidate.supporting, *candidate.supporting)
+            }
+            merged[merged.index(longer_candidate)] = _ScoredCandidate(
+                score=max(longer_candidate.score, candidate.score),
+                start=longer_candidate.start,
+                end=longer_candidate.end,
+                from_value=longer_candidate.from_value,
+                to_value=longer_candidate.to_value,
+                supporting=tuple(
+                    sorted(
+                        supporting_by_id.values(),
+                        key=lambda item: (item.start, item.end, item.evidence_id),
+                    )
+                ),
+            )
+        return merged
+
+    def _has_qualifying_visual_support(self, candidate: _ScoredCandidate) -> bool:
+        return any(
+            item.kind is EvidenceKind.FRAME_OCR and item.confidence >= 0.85
+            for item in candidate.supporting
+        )
+
+    def _is_truncated_variant(self, shorter: str, longer: str) -> bool:
+        shorter_words = shorter.casefold().split()
+        longer_words = longer.casefold().split()
+        if len(shorter_words) != len(longer_words) or not shorter_words:
+            return False
+        if shorter_words[:-1] != longer_words[:-1]:
+            return False
+        shorter_tail = shorter_words[-1]
+        longer_tail = longer_words[-1]
+        missing_characters = len(longer_tail) - len(shorter_tail)
+        return (
+            len(shorter_tail) >= 8
+            and missing_characters == 1
+            and longer_tail.startswith(shorter_tail)
+            and shorter_tail.endswith("in")
+            and longer_tail.endswith("ing")
+        )
 
     def _technical_candidates(self, observed_text: str) -> list[str]:
         candidates: list[str] = []

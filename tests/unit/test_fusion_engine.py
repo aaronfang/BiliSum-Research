@@ -192,6 +192,180 @@ def test_reconcile_keeps_conflicting_visual_candidates_as_uncertain() -> None:
     }
 
 
+def test_reconcile_merges_truncated_and_complete_visual_candidates() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=2, end=4, text="Loof Engine 也有认诺"),),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-truncated",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineerin",
+                start=2.8,
+                end=2.8,
+                confidence=0.9,
+                derivation_method="frame_ocr",
+                source_ref="frame-truncated.jpg",
+                media_ref="video.mp4",
+            ),
+            EvidenceItem(
+                evidence_id="frame-complete",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineering",
+                start=3.2,
+                end=3.2,
+                confidence=0.9,
+                derivation_method="frame_ocr",
+                source_ref="frame-complete.jpg",
+                media_ref="video.mp4",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loop Engineering 也有认诺"
+    assert len(corrected.corrections) == 1
+    assert corrected.corrections[0].to_value == "Loop Engineering"
+    assert corrected.corrections[0].decision is CorrectionDecision.ACCEPTED
+    assert corrected.corrections[0].rule_version == "technical-token-v2"
+    assert corrected.corrections[0].evidence_ids == (
+        "frame-truncated",
+        "frame-complete",
+    )
+    assert corrected.corrections[0].alternatives == ()
+
+
+def test_reconcile_does_not_transfer_confidence_to_a_weak_complete_candidate() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=2, end=4, text="Loof Engine 也有认诺"),),
+    )
+    evidence = EvidenceSet(
+        items=(
+            EvidenceItem(
+                evidence_id="frame-truncated",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineerin",
+                start=2.8,
+                end=2.8,
+                confidence=0.99,
+                derivation_method="frame_ocr",
+                source_ref="frame-truncated.jpg",
+                media_ref="video.mp4",
+            ),
+            EvidenceItem(
+                evidence_id="frame-complete-blurry",
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text="Loop Engineering",
+                start=3.2,
+                end=3.2,
+                confidence=0.2,
+                derivation_method="frame_ocr",
+                source_ref="frame-complete-blurry.jpg",
+                media_ref="video.mp4",
+            ),
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loof Engine 也有认诺"
+    assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN
+    assert {item.value for item in corrected.corrections[0].alternatives} == {
+        "Loop Engineerin",
+        "Loop Engineering",
+    }
+
+
+def test_reconcile_keeps_distinct_prefix_related_names_uncertain() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=2, end=4, text="Pythom Test"),),
+    )
+    evidence = EvidenceSet(
+        items=tuple(
+            EvidenceItem(
+                evidence_id=evidence_id,
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text=observed_text,
+                start=timestamp,
+                end=timestamp,
+                confidence=0.95,
+                derivation_method="frame_ocr",
+                source_ref=f"{evidence_id}.jpg",
+                media_ref="video.mp4",
+            )
+            for evidence_id, observed_text, timestamp in (
+                ("frame-test", "Python Test", 2.8),
+                ("frame-tester", "Python Tester", 3.2),
+            )
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Pythom Test"
+    assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN
+    assert {item.value for item in corrected.corrections[0].alternatives} == {
+        "Python Test",
+        "Python Tester",
+    }
+
+
+def test_reconcile_keeps_long_one_character_suffix_conflicts_uncertain() -> None:
+    raw = Transcript(
+        source=TranscriptSource(
+            kind=TranscriptSourceKind.ASR,
+            location="audio.wav",
+            automatic=True,
+        ),
+        segments=(TranscriptSegment(start=2, end=4, text="Loof Engineer"),),
+    )
+    evidence = EvidenceSet(
+        items=tuple(
+            EvidenceItem(
+                evidence_id=evidence_id,
+                kind=EvidenceKind.FRAME_OCR,
+                observed_text=observed_text,
+                start=timestamp,
+                end=timestamp,
+                confidence=0.95,
+                derivation_method="frame_ocr",
+                source_ref=f"{evidence_id}.jpg",
+                media_ref="video.mp4",
+            )
+            for evidence_id, observed_text, timestamp in (
+                ("frame-engineer", "Loop Engineer", 2.8),
+                ("frame-engineers", "Loop Engineers", 3.2),
+            )
+        )
+    )
+
+    corrected = FusionEngine().reconcile(raw, evidence)
+
+    assert corrected.text == "Loof Engineer"
+    assert corrected.corrections[0].decision is CorrectionDecision.UNCERTAIN
+    assert {item.value for item in corrected.corrections[0].alternatives} == {
+        "Loop Engineer",
+        "Loop Engineers",
+    }
+
+
 def test_reconcile_audits_subtitle_asr_visual_and_context_support_together() -> None:
     raw = Transcript(
         source=TranscriptSource(
