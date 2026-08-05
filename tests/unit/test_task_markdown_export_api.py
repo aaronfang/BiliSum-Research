@@ -246,7 +246,8 @@ def test_export_task_markdown_renders_mindmap_and_copies_json(tmp_path: Path) ->
     task_id = create_completed_task(repository)
     record = repository.get_task(task_id)
     assert record is not None and record.result is not None
-    mindmap_path = tmp_path / "mindmap.json"
+    mindmap_path = tmp_path / "tasks" / task_id / "mindmap.json"
+    mindmap_path.parent.mkdir(parents=True, exist_ok=True)
     mindmap_path.write_text(
         '{"version":1,"title":"导图","root":"root","nodes":[{"id":"root","label":"导图","type":"root","children":[{"id":"theme","label":"主题","type":"theme","children":[]}]}]}',
         encoding="utf-8",
@@ -280,27 +281,22 @@ def test_export_task_markdown_renders_mindmap_and_copies_json(tmp_path: Path) ->
     assert str(mindmap_path) not in content
 
 
-def test_export_task_markdown_can_include_transcript_and_override_output_dir(tmp_path: Path) -> None:
+def test_export_task_markdown_can_include_transcript_from_configured_output_dir(tmp_path: Path) -> None:
     repository = create_repository()
     task_id = create_completed_task(repository)
     app.state.task_repository = repository
+    output_dir = tmp_path / "picked-vault"
     settings = ServiceSettings(
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
         tasks_dir=tmp_path / "tasks",
-        output_dir=str(tmp_path / "default-vault"),
+        output_dir=str(output_dir),
     )
     settings_manager._settings = settings
 
-    response = export_task_markdown(
-        repository,
-        settings,
-        task_id,
-        include_transcript=True,
-        output_dir=str(tmp_path / "picked-vault"),
-    )
+    response = export_task_markdown(repository, settings, task_id, include_transcript=True)
 
-    assert Path(response.path).parent == tmp_path / "picked-vault"
+    assert Path(response.path).parent == output_dir
     content = Path(response.path).read_text(encoding="utf-8")
     assert "## 转写全文" in content
     assert "[00:00] 转写内容" in content

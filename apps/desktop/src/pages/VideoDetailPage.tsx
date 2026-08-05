@@ -1620,10 +1620,13 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         setStatus("已取消导出。");
         return;
       }
+      if (pickedDirectory) {
+        const settingsResponse = await api.updateSettings({ output_dir: pickedDirectory });
+        setKnowledgeOutputDir(settingsResponse.settings.output_dir || pickedDirectory);
+      }
       const response = await api.exportTaskMarkdown(selectedTaskId, {
         target,
         include_transcript: includeTranscriptInNoteExport,
-        output_dir: pickedDirectory || undefined,
         tags,
       });
       setLastKnowledgeExport(response);
@@ -1652,7 +1655,11 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         setStatus("已取消导出。");
         return;
       }
-      const response = await api.exportTaskTranscript(selectedTaskId, { output_dir: pickedDirectory || undefined });
+      if (pickedDirectory) {
+        const settingsResponse = await api.updateSettings({ output_dir: pickedDirectory });
+        setKnowledgeOutputDir(settingsResponse.settings.output_dir || pickedDirectory);
+      }
+      const response = await api.exportTaskTranscript(selectedTaskId);
       setLastKnowledgeExport(response);
       setKnowledgeOutputDir((current) => current || response.directory);
       await refreshDetail({ preferredTaskId: selectedTaskId, forceTaskIds: [selectedTaskId] });

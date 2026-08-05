@@ -31,6 +31,18 @@ def _resolve_export_directory(raw_path: str) -> Path:
     return Path(os.path.realpath(expanded_path))
 
 
+def _resolve_task_artifact_path(raw_path: str | None, tasks_dir: Path) -> Path | None:
+    if not raw_path:
+        return None
+    safe_root = tasks_dir.expanduser().resolve()
+    candidate = Path(raw_path).expanduser().resolve()
+    try:
+        candidate.relative_to(safe_root)
+    except ValueError:
+        return None
+    return candidate
+
+
 def export_task_markdown(
     repository: SqliteTaskRepository,
     current_settings: ServiceSettings,
@@ -56,7 +68,7 @@ def export_task_markdown(
     if not result.knowledge_note_markdown.strip():
         raise HTTPException(status_code=400, detail="当前任务缺少知识笔记，暂时无法导出 Markdown。")
 
-    output_dir_raw = str(output_dir or current_settings.output_dir or "").strip()
+    output_dir_raw = str(current_settings.output_dir or "").strip()
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先在设置中配置输出目录，再导出 Markdown / Obsidian 笔记。")
 
@@ -85,14 +97,17 @@ def export_task_markdown(
         or result.artifacts.get("visual_note_path")
     )
     enhanced_note_markdown, _visual_asset_paths = _prepare_visual_note_for_export(
-        enhanced_note_path,
+        _resolve_task_artifact_path(enhanced_note_path, current_settings.tasks_dir),
         export_directory,
         export_path.name,
         target=normalized_target,
     )
     if enhanced_note_markdown.strip() and result.visual_note_status in {"ready", "partial"}:
         note_markdown = enhanced_note_markdown
-    mindmap_source_path = result.mindmap_artifact_path or result.artifacts.get("mindmap_path")
+    mindmap_source_path = _resolve_task_artifact_path(
+        result.mindmap_artifact_path or result.artifacts.get("mindmap_path"),
+        current_settings.tasks_dir,
+    )
     mindmap_markdown, mindmap_asset_path = _prepare_mindmap_for_export(
         mindmap_source_path,
         export_directory,
@@ -214,7 +229,7 @@ def export_task_transcript(
     if not transcript:
         raise HTTPException(status_code=400, detail="当前任务缺少转写全文，暂时无法导出 transcript。")
 
-    output_dir_raw = str(output_dir or current_settings.output_dir or "").strip()
+    output_dir_raw = str(current_settings.output_dir or "").strip()
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先选择导出目录，或在设置中配置输出目录。")
 
