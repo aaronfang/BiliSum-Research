@@ -579,6 +579,46 @@ def test_build_aggregate_summary_inputs_collects_partial_summaries() -> None:
     assert "全局章节 A" in segments_json
 
 
+def test_build_aggregate_summary_inputs_accepts_llm_timecodes() -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
+
+    transcript, segments_json = runner._build_aggregate_summary_inputs(
+        [
+            {
+                "chunk_index": 1,
+                "title": "分块一",
+                "overview": "时间码格式测试",
+                "bulletPoints": [],
+                "chapters": [
+                    {"title": "章节 A", "start": "0:00:00.000", "summary": "章节摘要 A"},
+                    {"title": "章节 B", "start": "0:00:45.667", "summary": "章节摘要 B"},
+                    {"title": "章节 C", "start": "00:02:04", "summary": "章节摘要 C"},
+                ],
+            },
+        ],
+        [
+            {"title": "全局章节", "start": 83.4, "summary": "全局摘要"},
+        ],
+    )
+
+    assert "[00:00] 章节 A：章节摘要 A" in transcript
+    assert "[00:45] 章节 B：章节摘要 B" in transcript
+    assert "[02:04] 章节 C：章节摘要 C" in transcript
+    assert '"start": 83.4' in segments_json
+
+
+def test_build_aggregate_summary_inputs_accepts_merged_timecodes() -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
+
+    transcript, segments_json = runner._build_aggregate_summary_inputs(
+        [],
+        [{"title": "全局章节", "start": "0:01:23.400", "summary": "全局摘要"}],
+    )
+
+    assert "[01:23] 全局章节：全局摘要" in transcript
+    assert '"start": 83.4' in segments_json
+
+
 def test_parse_llm_json_content_accepts_fenced_json() -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
 

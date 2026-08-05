@@ -390,6 +390,8 @@ def transcribe_funasr(
         "device": device,
         "hub": hub,
         "ncpu": _funasr_ncpu,
+        # Avoid FunASR's startup version check blocking on an unavailable network.
+        "disable_update": True,
     }
 
     if vad_model:
@@ -485,10 +487,11 @@ def transcribe_funasr(
     generate_kwargs = {
         "input": str(audio_path),
         "batch_size": 1,
-        # Larger dynamic batch improves GPU utilization in VAD mode.
-        # ``inference_with_vad`` aggregates VAD segments until they reach
-        # ``batch_size_s`` seconds of audio before one GPU forward pass.
-        "batch_size_s": 300,
+        # Keep each GPU forward pass bounded.  Large Paraformer batches can
+        # allocate attention tensors proportional to the batch duration and
+        # exhaust a 16 GB GPU before FunASR can report an exception.
+        "batch_size_s": 30,
+        "batch_size_threshold_s": 30,
         # Emit per-batch progress so the service can report a moving
         # percentage instead of sitting at 62% for the whole transcription.
         "disable_pbar": True,

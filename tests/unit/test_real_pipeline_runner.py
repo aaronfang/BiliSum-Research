@@ -30,6 +30,58 @@ def _build_runner() -> RealPipelineRunner:
     )
 
 
+def test_normalize_summary_accepts_timecode_chapter_starts(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+
+    summary = runner._normalize_summary(
+        {
+            "title": "测试摘要",
+            "overview": "概览",
+            "bulletPoints": ["要点"],
+            "chapters": [
+                {"title": "第一章", "start": "1:23", "summary": "章节摘要"},
+            ],
+            "chapterGroups": [
+                {
+                    "title": "主题",
+                    "start": "00:02:04",
+                    "summary": "主题摘要",
+                    "children": [
+                        {"title": "第一章", "start": "1:23", "summary": "章节摘要"},
+                    ],
+                },
+            ],
+        },
+        transcript="[00:00] 内容",
+        segments=[{"start": 0.0, "end": 10.0, "text": "内容"}],
+        title="测试摘要",
+    )
+
+    assert summary["chapters"][0]["start"] == 83.0
+    assert summary["chapterGroups"][0]["start"] == 124.0
+    assert summary["chapterGroups"][0]["children"][0]["start"] == 83.0
+
+
+def test_normalize_summary_ignores_invalid_chapter_timecodes(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+
+    summary = runner._normalize_summary(
+        {
+            "title": "测试摘要",
+            "overview": "概览",
+            "chapters": [
+                {"title": "非法时间", "start": "not-a-timecode", "summary": "章节摘要"},
+            ],
+        },
+        transcript="[00:00] 内容",
+        segments=[{"start": 0.0, "end": 10.0, "text": "内容"}],
+        title="测试摘要",
+    )
+
+    assert summary["chapters"]
+    assert summary["chapters"][0]["start"] == 0.0
+
+
 def test_mindmap_normalization_accepts_list_wrapped_timestamps(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
     result = TaskResult(
@@ -162,6 +214,59 @@ def test_visual_download_uses_youtube_cookies_and_ejs_runtime(
     assert captured["cookiefile"] == str(cookiefile)
     assert captured["remote_components"] == ["ejs:github"]
     assert captured["js_runtimes"] == {"node": {"path": r"C:\Program Files\nodejs\node.exe"}}
+    assert "Referer" not in captured["http_headers"]
+
+
+def test_audio_download_uses_youtube_cookies_and_platform_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import video_sum_core.pipeline.real as real_module
+
+    cookiefile = tmp_path / "youtube.txt"
+    cookiefile.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path / "tasks",
+            ytdlp_youtube_cookies_file=str(cookiefile),
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def download(self, urls):
+            output_template = str(captured["outtmpl"])
+            Path(output_template.replace("%(ext)s", "mp3")).write_bytes(b"audio")
+
+    monkeypatch.setattr(real_module, "_get_ytdlp_classes", lambda: (FakeYoutubeDL, DownloadError))
+    monkeypatch.setattr(real_module, "ffmpeg_location", lambda: None)
+    monkeypatch.setattr(
+        real_module.shutil,
+        "which",
+        lambda name: r"C:\\Program Files\\nodejs\\node.exe" if name == "node" else None,
+    )
+    (tmp_path / "audio").mkdir()
+
+    source = runner._download_audio(
+        "https://www.youtube.com/watch?v=test-audio",
+        tmp_path / "audio",
+        "test-audio",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert source.exists()
+    assert captured["cookiefile"] == str(cookiefile)
+    assert "Referer" not in captured["http_headers"]
+    assert captured["remote_components"] == ["ejs:github"]
 
 
 def test_local_ollama_uses_small_chunk_model_and_resumes_cache(
