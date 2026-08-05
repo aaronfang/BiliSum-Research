@@ -34,6 +34,39 @@ _BILIBILI_HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://www.bilibili.com/",
 }
+_SUPPORTED_COOKIE_BROWSERS = {
+    "brave",
+    "chrome",
+    "chromium",
+    "edge",
+    "firefox",
+    "opera",
+    "safari",
+    "vivaldi",
+    "whale",
+}
+
+
+def is_youtube_url(url: str) -> bool:
+    try:
+        raw_url = str(url or "").strip()
+        parsed = urlparse(raw_url if "://" in raw_url else f"//{raw_url}")
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname in {"youtube.com", "youtu.be"} or hostname.endswith(".youtube.com")
+
+
+def configure_youtube_runtime(options: dict[str, object], url: str) -> None:
+    if not is_youtube_url(url):
+        return
+    for runtime_name in ("deno", "node"):
+        runtime_path = shutil.which(runtime_name)
+        if runtime_path:
+            options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+            return
+
+
 LOCAL_VIDEO_SUFFIXES = {
     ".mp4",
     ".mov",
@@ -104,7 +137,43 @@ def build_page_title(base_title: str, page: int, info: dict[str, object]) -> str
     return f"P{page} {candidate}"
 
 
-def build_ydl_probe_options(*, extract_flat: bool = False) -> dict[str, object]:
+def pick_ytdlp_cookie_file(url: str) -> str:
+    settings = settings_manager.current
+    if is_youtube_url(url):
+        return str(
+            settings.ytdlp_youtube_cookies_file
+            or settings.ytdlp_cookies_file
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+            or os.environ.get("YTDLP_COOKIES_FILE")
+            or ""
+        ).strip()
+    return str(
+        settings.ytdlp_cookies_file
+        or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+        or os.environ.get("YTDLP_COOKIES_FILE")
+        or ""
+    ).strip()
+
+
+def pick_ytdlp_cookie_browser(url: str) -> str:
+    settings = settings_manager.current
+    if is_youtube_url(url):
+        return str(
+            settings.ytdlp_youtube_cookies_browser
+            or settings.ytdlp_cookies_browser
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_BROWSER")
+            or os.environ.get("YTDLP_COOKIES_BROWSER")
+            or ""
+        ).strip().lower()
+    return str(
+        settings.ytdlp_cookies_browser
+        or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_BROWSER")
+        or os.environ.get("YTDLP_COOKIES_BROWSER")
+        or ""
+    ).strip().lower()
+
+
+def build_ydl_probe_options(url: str = "", *, extract_flat: bool = False) -> dict[str, object]:
     options: dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
@@ -115,18 +184,19 @@ def build_ydl_probe_options(*, extract_flat: bool = False) -> dict[str, object]:
         "sleep_interval_requests": 1,
         "socket_timeout": 30,
     }
-    cookie_file = str(
-        settings_manager.current.ytdlp_cookies_file
-        or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
-        or os.environ.get("YTDLP_COOKIES_FILE")
-        or ""
-    ).strip()
+    cookie_file = pick_ytdlp_cookie_file(url)
     if cookie_file:
         cookie_path = Path(cookie_file).expanduser()
         if cookie_path.exists() and cookie_path.is_file():
             options["cookiefile"] = str(cookie_path)
         else:
             logger.warning("yt-dlp cookie file does not exist: %s", cookie_path)
+    else:
+        cookie_browser = pick_ytdlp_cookie_browser(url)
+        if cookie_browser in _SUPPORTED_COOKIE_BROWSERS:
+            options["cookiesfrombrowser"] = (cookie_browser,)
+        elif cookie_browser:
+            logger.warning("unsupported yt-dlp cookie browser: %s", cookie_browser)
     if extract_flat:
         options["extract_flat"] = "in_playlist"
     return options
@@ -143,18 +213,25 @@ def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, obj
 
         DownloadError = YtDlpDownloadError
 
-    options = build_ydl_probe_options(extract_flat=extract_flat)
+    options = build_ydl_probe_options(url, extract_flat=extract_flat)
+    configure_youtube_runtime(options, url)
     try:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
     except DownloadError as exc:
         message = str(exc)
+        is_youtube = is_youtube_url(url)
+        platform_cookie_help = (
+            "请在设置中填写 YouTube Cookies 文件，或通过“YouTube 登录获取”按钮捕获登录态。"
+            if is_youtube
+            else "请在设置中填写 B 站 Cookies 文件，或通过“B 站登录获取”按钮捕获登录态。"
+        )
         if "Could not copy Chrome cookie database" in message:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "无法读取 Chrome 登录态：yt-dlp 不能复制 Chrome Cookie 数据库。"
-                    "请通过 BiliSum 的 B 站登录窗口重新捕获登录态，或按教程导出 cookies.txt 并填写 yt-dlp Cookies 文件。"
+                    + platform_cookie_help
                 ),
             ) from exc
         if "Failed to decrypt with DPAPI" in message:
@@ -162,7 +239,7 @@ def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, obj
                 status_code=400,
                 detail=(
                     "无法读取浏览器登录态：yt-dlp 解密 Windows 浏览器 Cookie 失败（DPAPI）。"
-                    "请通过 BiliSum 的 B 站登录窗口重新捕获登录态，或按教程导出 cookies.txt 并填写 yt-dlp Cookies 文件。"
+                    + platform_cookie_help
                 ),
             ) from exc
         if "HTTP Error 412" in message and "BiliBili" in message:
@@ -170,10 +247,24 @@ def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, obj
                 status_code=400,
                 detail=(
                     "B 站返回 HTTP 412，当前请求可能被风控拦截。"
-                    "请稍后重试、切换网络，或通过 BiliSum 的 B 站登录窗口捕获登录态。"
+                    "请稍后重试、切换网络，或通过“B 站登录获取”按钮捕获登录态。"
                 ),
             ) from exc
-        raise
+        lowered_message = message.lower()
+        if is_youtube_url(url) and (
+            "sign in to confirm" in lowered_message
+            or "not a bot" in lowered_message
+            or "cookies-from-browser" in lowered_message
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "YouTube 要求登录态才能读取此视频。请在设置中填写 YouTube Cookies 文件，"
+                    "或通过“YouTube 登录获取”按钮捕获登录态后重试。"
+                ),
+            ) from exc
+        detail = message.splitlines()[0].strip() or "yt-dlp 未能读取视频信息。"
+        raise HTTPException(status_code=400, detail=f"无法读取视频信息：{detail}") from exc
     if not isinstance(info, dict):
         raise HTTPException(status_code=400, detail="无法读取视频信息。")
     return info

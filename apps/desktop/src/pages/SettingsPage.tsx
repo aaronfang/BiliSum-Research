@@ -121,6 +121,12 @@ type BilibiliCookieCaptureResult = {
   browser?: string;
 };
 
+type YoutubeCookieCaptureResult = {
+  cookiesFile: string;
+  cookieCount: number;
+  browser: string;
+};
+
 const MASKED_API_KEY = "******";
 const DEFAULT_SILICONFLOW_EMBEDDING_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_SILICONFLOW_EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5";
@@ -163,6 +169,7 @@ const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
   { category: "files", targetKey: "cache_dir", title: "缓存目录", description: "临时缓存文件保存位置。", keywords: ["cache", "缓存", "临时文件"] },
   { category: "files", targetKey: "tasks_dir", title: "任务目录", description: "任务历史和结果文件位置。", keywords: ["task", "tasks", "任务", "历史"] },
   { category: "files", targetKey: "output_dir", title: "输出目录", description: "Markdown / Obsidian 导出目录。", keywords: ["output", "导出", "obsidian", "markdown", "笔记"] },
+  { category: "files", targetKey: "auto_export_obsidian", title: "自动导出 Obsidian", description: "总结完成后自动写入 Obsidian 输出目录。", keywords: ["自动导出", "obsidian", "auto export", "笔记"] },
   { category: "files", targetKey: "storage_cleanup", title: "空间清理", description: "查看占用并清理缓存和孤儿任务。", keywords: ["清理", "空间", "缓存", "孤儿", "storage"] },
   { category: "transcription", targetKey: "transcription_provider", title: "转写方式", description: "选择云端 ASR 或本地 ASR。", keywords: ["asr", "转写", "语音识别", "whisper", "本地"] },
   { category: "transcription", targetKey: "siliconflow_asr_base_url", title: "SiliconFlow Base URL", description: "云端转写 API 地址。", keywords: ["siliconflow", "base url", "api", "硅基流动"] },
@@ -216,7 +223,10 @@ const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
   { category: "performance", targetKey: "runtime_channel", title: "运行环境通道", description: "选择基础版或 GPU 运行环境。", keywords: ["runtime", "运行环境", "gpu", "base"] },
   { category: "video", targetKey: "preserve_temp_audio", title: "保留临时音频", description: "控制是否保留转写中间音频。", keywords: ["音频", "临时", "preserve", "temp"] },
   { category: "video", targetKey: "enable_cache", title: "启用缓存", description: "控制任务缓存行为。", keywords: ["缓存", "cache"] },
-  { category: "video", targetKey: "ytdlp_cookies_file", title: "yt-dlp Cookies 文件", description: "配置 B 站登录态 cookies.txt。", keywords: ["cookie", "cookies", "b站", "登录", "风控", "412"] },
+  { category: "video", targetKey: "ytdlp_cookies_file", title: "B 站 Cookies 文件", description: "配置 B 站登录态 cookies.txt。", keywords: ["cookie", "cookies", "b站", "登录", "风控", "412"] },
+  { category: "video", targetKey: "ytdlp_cookies_browser", title: "B 站浏览器登录态", description: "让 yt-dlp 从本机浏览器读取 B 站登录态。", keywords: ["cookie", "cookies", "浏览器", "Chrome", "Edge", "Firefox", "b站"] },
+  { category: "video", targetKey: "ytdlp_youtube_cookies_file", title: "YouTube Cookies 文件", description: "配置 YouTube 登录态 cookies.txt，绕过“确认你不是机器人”。", keywords: ["cookie", "cookies", "youtube", "登录", "机器人", "bot"] },
+  { category: "video", targetKey: "ytdlp_youtube_cookies_browser", title: "YouTube 浏览器登录态", description: "让 yt-dlp 从本机浏览器读取 YouTube 登录态。", keywords: ["cookie", "cookies", "浏览器", "Chrome", "Edge", "Firefox", "youtube"] },
   { category: "runtime", targetKey: "runtime_status", title: "运行环境状态", description: "检查 Python、Torch、CUDA 与扩展依赖。", keywords: ["运行环境", "环境", "torch", "python", "cuda"] },
   { category: "runtime", targetKey: "local_asr_runtime", title: "本地 ASR 运行环境", description: "安装或检查本地 ASR 依赖。", keywords: ["本地", "asr", "whisper", "安装"] },
   { category: "runtime", targetKey: "funasr_runtime", title: "FunASR 运行环境", description: "安装或检查 FunASR 依赖（中文效果优于 Whisper）。", keywords: ["funasr", "qwen", "asr", "安装", "中文"] },
@@ -379,6 +389,8 @@ export function SettingsPage({
   const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState("");
   const [bilibiliQrcodeKey, setBilibiliQrcodeKey] = useState("");
   const [bilibiliQrcodeImage, setBilibiliQrcodeImage] = useState("");
+  const [youtubeCookieCapturing, setYoutubeCookieCapturing] = useState(false);
+  const [youtubeCookieStatus, setYoutubeCookieStatus] = useState("");
   const [knowledgeDepsStatus, setKnowledgeDepsStatus] = useState("");
   const [knowledgeDepsOutput, setKnowledgeDepsOutput] = useState("");
   const [knowledgeDepsInstalling, setKnowledgeDepsInstalling] = useState(false);
@@ -420,6 +432,9 @@ export function SettingsPage({
   const [taskListLoading, setTaskListLoading] = useState(false);
   const [taskListError, setTaskListError] = useState("");
   const [taskList, setTaskList] = useState<TaskSummary[]>([]);
+  const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(new Set());
+  const [batchExportBusy, setBatchExportBusy] = useState(false);
+  const [batchExportStatus, setBatchExportStatus] = useState("");
   const settingsNavRef = useRef<HTMLElement | null>(null);
   const settingsContentScrollRef = useRef<HTMLDivElement | null>(null);
   const promptDetailsRefs = useRef<Record<string, HTMLDetailsElement | null>>({});
@@ -995,10 +1010,44 @@ export function SettingsPage({
       setTaskListError("");
       const tasks = await api.listTasks();
       setTaskList(tasks.slice(0, TASK_LIST_LIMIT));
+      setSelectedTaskIds((current) => new Set([...current].filter((taskId) => tasks.some((task) => task.task_id === taskId && task.status === "completed"))));
     } catch (error) {
       setTaskListError(error instanceof Error ? error.message : "读取任务列表失败");
     } finally {
       setTaskListLoading(false);
+    }
+  }
+
+  function toggleTaskSelection(taskId: string) {
+    setSelectedTaskIds((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) {
+        next.delete(taskId);
+      } else {
+        next.add(taskId);
+      }
+      return next;
+    });
+    setBatchExportStatus("");
+  }
+
+  async function exportSelectedTasks() {
+    const taskIds = Array.from(selectedTaskIds);
+    if (!taskIds.length) {
+      setBatchExportStatus("请先选择已完成的任务。");
+      return;
+    }
+    try {
+      setBatchExportBusy(true);
+      setBatchExportStatus("");
+      const response = await api.exportTasksMarkdown({ task_ids: taskIds, target: "obsidian" });
+      const failedCount = response.failed.length;
+      setBatchExportStatus(`已导出 ${response.exported.length} 条${failedCount ? `，${failedCount} 条失败` : ""}。`);
+      setSelectedTaskIds(new Set());
+    } catch (error) {
+      setBatchExportStatus(error instanceof Error ? error.message : "批量导出失败");
+    } finally {
+      setBatchExportBusy(false);
     }
   }
 
@@ -1839,6 +1888,36 @@ export function SettingsPage({
     }
   }
 
+  async function captureYoutubeLoginCookies() {
+    if (!form || youtubeCookieCapturing) {
+      return;
+    }
+    try {
+      setYoutubeCookieCapturing(true);
+      setYoutubeCookieStatus("请在新窗口登录 YouTube，登录成功后会自动保存 cookies...");
+      const desktopYoutube = window.desktop?.youtube;
+      if (!desktopYoutube) {
+        setYoutubeCookieStatus("当前运行环境不支持自动登录 YouTube，请手动导出 cookies.txt 并填写到上方输入框。");
+        return;
+      }
+      const captured: YoutubeCookieCaptureResult = await desktopYoutube.captureLoginCookies();
+      const response = await api.updateSettings({
+        ytdlp_youtube_cookies_file: captured.cookiesFile,
+        ytdlp_youtube_cookies_browser: "",
+      });
+      const nextSettings = maskConfiguredApiKeys(response.settings);
+      setForm(nextSettings);
+      setIsDirty(false);
+      setSaveStatus(response.message || "设置已保存");
+      setYoutubeCookieStatus(`YouTube 登录态已保存（${captured.browser}），捕获 ${captured.cookieCount} 条 cookies。`);
+      onSettingsSaved(response.settings, environment);
+    } catch (error) {
+      setYoutubeCookieStatus(error instanceof Error ? error.message : "捕获 YouTube 登录态失败，请按教程手动导出 cookies.txt。");
+    } finally {
+      setYoutubeCookieCapturing(false);
+    }
+  }
+
   function buildLlmTestPayload(scope: GenerationModelScope) {
     if (!form) {
       return null;
@@ -2103,8 +2182,17 @@ export function SettingsPage({
       }
       return { category: "generation", targetKey: "llm_base_url" };
     }
-    if (issueKey === "ytdlp_cookies_browser" || issueKey === "ytdlp_cookies_file") {
+    if (issueKey === "ytdlp_cookies_browser") {
+      return { category: "video", targetKey: "ytdlp_cookies_browser" };
+    }
+    if (issueKey === "ytdlp_cookies_file") {
       return { category: "video", targetKey: "ytdlp_cookies_file" };
+    }
+    if (issueKey === "ytdlp_youtube_cookies_browser") {
+      return { category: "video", targetKey: "ytdlp_youtube_cookies_browser" };
+    }
+    if (issueKey === "ytdlp_youtube_cookies_file") {
+      return { category: "video", targetKey: "ytdlp_youtube_cookies_file" };
     }
     return null;
   }
@@ -2504,6 +2592,7 @@ export function SettingsPage({
                   <button className="tertiary-button" type="button" onClick={() => setActiveCategory("logs")}>查看日志</button>
                   <button className="tertiary-button" type="button" onClick={() => setActiveCategory("transcription")}>转写设置</button>
                   <button className="tertiary-button" type="button" onClick={() => setActiveCategory("generation")}>摘要设置</button>
+                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("files")}>Obsidian 导出</button>
                 </div>
               </div>
             </section>
@@ -2538,6 +2627,43 @@ export function SettingsPage({
                   <input className="settings-input-field" value={String(form.output_dir)} onChange={(e) => updateForm({ ...form, output_dir: e.target.value })} />
                   <span className="settings-input-caption">手动导出的 Markdown / Obsidian 笔记会写入这里。</span>
                 </label>
+                <div className="settings-input-group" ref={registerFocusTarget("auto_export_obsidian") as (node: HTMLDivElement | null) => void}>
+                  <div className="settings-toggle-row">
+                    <div className="settings-toggle-label">
+                      <span className="settings-toggle-title">总结完成后自动导出到 Obsidian</span>
+                      <span className="settings-toggle-caption">任务完成后自动写入上面的输出目录；如果随后生成图文笔记或思维导图，会自动更新同一条笔记。</span>
+                    </div>
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={form.auto_export_obsidian || false}
+                        onChange={(e) => updateForm({ ...form, auto_export_obsidian: e.target.checked })}
+                      />
+                      <span className="toggle-slider" />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {activeCategory === "files" && (
+            <section className="settings-category-section">
+              <header className="settings-category-header">
+                <h2>批量导入笔记</h2>
+                <p>选择已完成的总结，一次性导入到上面的 Obsidian 输出目录。</p>
+              </header>
+              <div className="settings-update-overview settings-batch-export-card">
+                <div className="settings-update-copy">
+                  <span className="settings-story-kicker">Obsidian</span>
+                  <h3>批量导入到 Obsidian</h3>
+                  <p>任务列表会显示最近的已完成任务。勾选需要导入的笔记后，点击批量导入即可。</p>
+                </div>
+                <div className="settings-inline-actions">
+                  <button className="primary-button" type="button" onClick={() => setTaskListOpen(true)}>
+                    打开任务列表并批量导入
+                  </button>
+                </div>
               </div>
             </section>
           )}
@@ -2655,7 +2781,7 @@ export function SettingsPage({
             <section className="settings-category-section">
               <header className="settings-category-header">
                 <h2>视频获取</h2>
-                <p>处理 B 站登录态、下载缓存和转写临时音频。遇到风控、登录或重复下载问题时先看这里。</p>
+                <p>处理 B 站、YouTube 登录态、下载缓存和转写临时音频。遇到风控、登录或重复下载问题时先看这里。</p>
               </header>
               <div className="settings-form-group">
                 <label
@@ -2667,8 +2793,8 @@ export function SettingsPage({
                     <input
                       className="settings-input-field"
                       value={form.ytdlp_cookies_file || ""}
-                      onChange={(e) => updateForm({ ...form, ytdlp_cookies_file: e.target.value })}
-                      placeholder="C:\\Users\\you\\Downloads\\cookies.txt"
+                      onChange={(e) => updateForm({ ...form, ytdlp_cookies_file: e.target.value, ytdlp_cookies_browser: "" })}
+                      placeholder="C:\\Users\\you\\Downloads\\bilibili-cookies.txt"
                     />
                     <button
                       className="secondary-button"
@@ -2676,10 +2802,31 @@ export function SettingsPage({
                       disabled={bilibiliCookieCapturing}
                       onClick={() => void captureBilibiliLoginCookies()}
                     >
-                      {bilibiliCookieCapturing ? "获取中..." : "登录获取"}
+                      {bilibiliCookieCapturing ? "获取中..." : "B 站登录获取"}
                     </button>
                   </div>
-                  <span className="settings-input-caption">推荐通过提示弹窗打开 B 站登录窗口自动生成；也可以手动填写从已登录浏览器导出的 cookies.txt。</span>
+                  <select
+                    className="settings-select-field"
+                    ref={registerFocusTarget("ytdlp_cookies_browser") as (node: HTMLSelectElement | null) => void}
+                    value={form.ytdlp_cookies_browser || ""}
+                    onChange={(e) => updateForm({
+                      ...form,
+                      ytdlp_cookies_browser: e.target.value,
+                      ytdlp_cookies_file: e.target.value ? "" : form.ytdlp_cookies_file,
+                    })}
+                  >
+                    <option value="">B 站浏览器登录态：不使用</option>
+                    <option value="edge">Microsoft Edge</option>
+                    <option value="chrome">Google Chrome</option>
+                    <option value="firefox">Firefox</option>
+                    <option value="brave">Brave</option>
+                    <option value="chromium">Chromium</option>
+                    <option value="opera">Opera</option>
+                    <option value="vivaldi">Vivaldi</option>
+                    <option value="whale">Whale</option>
+                    <option value="safari">Safari</option>
+                  </select>
+                  <span className="settings-input-caption">B 站登录态与 YouTube 相互独立，可同时生效。可手动填写导出的 cookies.txt，或点击“B 站登录获取”在新窗口登录后自动写入。</span>
                   {bilibiliQrcodeImage ? (
                     <div className="settings-cookie-qrcode">
                       <img src={bilibiliQrcodeImage} alt="B 站扫码登录二维码" />
@@ -2687,6 +2834,51 @@ export function SettingsPage({
                     </div>
                   ) : null}
                   {bilibiliCookieStatus ? <span className="settings-input-caption">{bilibiliCookieStatus}</span> : null}
+                </label>
+                <label
+                  className={`settings-input-group settings-focus-target ${activeFocusTarget === "ytdlp_youtube_cookies_file" ? "is-highlighted" : ""}`}
+                  ref={registerFocusTarget("ytdlp_youtube_cookies_file") as (node: HTMLLabelElement | null) => void}
+                >
+                  <span className="settings-input-label">YouTube Cookies 文件</span>
+                  <div className="settings-input-action-row">
+                    <input
+                      className="settings-input-field"
+                      value={form.ytdlp_youtube_cookies_file || ""}
+                      onChange={(e) => updateForm({ ...form, ytdlp_youtube_cookies_file: e.target.value, ytdlp_youtube_cookies_browser: "" })}
+                      placeholder="C:\\Users\\you\\Downloads\\youtube-cookies.txt"
+                    />
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={youtubeCookieCapturing}
+                      onClick={() => void captureYoutubeLoginCookies()}
+                    >
+                      {youtubeCookieCapturing ? "获取中..." : "YouTube 登录获取"}
+                    </button>
+                  </div>
+                  <select
+                    className="settings-select-field"
+                    ref={registerFocusTarget("ytdlp_youtube_cookies_browser") as (node: HTMLSelectElement | null) => void}
+                    value={form.ytdlp_youtube_cookies_browser || ""}
+                    onChange={(e) => updateForm({
+                      ...form,
+                      ytdlp_youtube_cookies_browser: e.target.value,
+                      ytdlp_youtube_cookies_file: e.target.value ? "" : form.ytdlp_youtube_cookies_file,
+                    })}
+                  >
+                    <option value="">YouTube 浏览器登录态：不使用</option>
+                    <option value="edge">Microsoft Edge</option>
+                    <option value="chrome">Google Chrome</option>
+                    <option value="firefox">Firefox</option>
+                    <option value="brave">Brave</option>
+                    <option value="chromium">Chromium</option>
+                    <option value="opera">Opera</option>
+                    <option value="vivaldi">Vivaldi</option>
+                    <option value="whale">Whale</option>
+                    <option value="safari">Safari</option>
+                  </select>
+                  <span className="settings-input-caption">用于绕过 YouTube 的“确认你不是机器人”验证。可手动填写导出的 cookies.txt，或点击“YouTube 登录获取”在新窗口登录后自动写入；两平台互不影响。</span>
+                  {youtubeCookieStatus ? <span className="settings-input-caption">{youtubeCookieStatus}</span> : null}
                 </label>
                 <label className="settings-input-group" ref={registerFocusTarget("enable_cache") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">启用下载缓存</span>
@@ -2846,12 +3038,13 @@ export function SettingsPage({
                     <label className="settings-input-group" ref={registerFocusTarget("funasr_model") as (node: HTMLLabelElement | null) => void}>
                       <span className="settings-input-label">FunASR 模型</span>
                       <select className="settings-select-field" value={form.funasr_model} onChange={(e) => updateForm({ ...form, funasr_model: e.target.value })}>
-                        <option value="paraformer-zh">paraformer-zh（中文通用，推荐）</option>
-                        <option value="iic/SenseVoiceSmall">SenseVoice-Small（多语言）</option>
-                        <option value="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch">SEACO Paraformer（高级，带时间戳）</option>
+                        <option value="auto">自动选择（按视频语言匹配模型，推荐）</option>
+                        <option value="paraformer-zh">paraformer-zh（中文通用）</option>
+                        <option value="iic/SenseVoiceSmall">SenseVoice-Small（多语言，英文推荐）</option>
+                        <option value="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch">SEACO Paraformer（中文高级，带时间戳）</option>
                         <option value="FunAudioLLM/Fun-ASR-Nano-2512">Fun-ASR-Nano（轻量级）</option>
                       </select>
-                      <span className="settings-input-caption">选择 FunASR 语音识别模型</span>
+                      <span className="settings-input-caption">选择 FunASR 语音识别模型；自动模式按视频语言匹配 paraformer-zh（中文）/ SenseVoice-Small（英文及其它语言）</span>
                     </label>
                     <label className="settings-input-group" ref={registerFocusTarget("funasr_device") as (node: HTMLLabelElement | null) => void}>
                       <span className="settings-input-label">运行设备</span>
@@ -4962,6 +5155,9 @@ export function SettingsPage({
                 <span>聚焦最近 {TASK_LIST_LIMIT} 条任务，方便确认 `queued` 与 `running` 的分布。</span>
               </div>
               <div className="settings-tasklist-actions">
+                <button className="primary-button" type="button" disabled={batchExportBusy || !selectedTaskIds.size} onClick={() => void exportSelectedTasks()}>
+                  {batchExportBusy ? "导出中..." : `批量导入 Obsidian${selectedTaskIds.size ? ` (${selectedTaskIds.size})` : ""}`}
+                </button>
                 <button className="secondary-button" type="button" disabled={taskListLoading} onClick={() => void refreshTaskList()}>
                   {taskListLoading ? "刷新中..." : "刷新"}
                 </button>
@@ -4974,6 +5170,8 @@ export function SettingsPage({
               <span className="helper-chip">最近 {taskList.length} 条</span>
               <span className={`helper-chip ${runningTaskCount ? "status-running" : "status-pending"}`}>运行中 {runningTaskCount}</span>
               <span className={`helper-chip ${queuedTaskCount ? "status-pending" : "status-success"}`}>排队中 {queuedTaskCount}</span>
+              <span className="helper-chip">已选 {selectedTaskIds.size} 条</span>
+              {batchExportStatus ? <span className="helper-chip status-success">{batchExportStatus}</span> : null}
             </div>
             {taskListError ? <div className="detail-error-banner" role="status">{taskListError}</div> : null}
             <div className="settings-tasklist-body">
@@ -4983,6 +5181,15 @@ export function SettingsPage({
                 <article key={task.task_id} className="settings-tasklist-item">
                   <div className="settings-tasklist-item-top">
                     <div className="settings-tasklist-item-meta">
+                      {task.status === "completed" ? (
+                        <label className="settings-tasklist-select" title="选择导入">
+                          <input
+                            type="checkbox"
+                            checked={selectedTaskIds.has(task.task_id)}
+                            onChange={() => toggleTaskSelection(task.task_id)}
+                          />
+                        </label>
+                      ) : null}
                       <span className={`task-status ${taskStatusClass(task.status)}`}>{taskStatusLabel(task.status)}</span>
                       {task.page_number === 0 ? (
                         <span className="helper-chip">{task.page_title || "全集总结"}</span>

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, NoReturn
+from urllib.parse import urlsplit
 
 import httpx
 from video_sum_infra.config import (
@@ -25,6 +26,8 @@ from video_sum_infra.config import (
     DEFAULT_SUMMARY_SYSTEM_PROMPT,
     DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
     normalize_visual_note_mode,
+    resolve_funasr_aux_models,
+    resolve_funasr_model,
 )
 from video_sum_infra.llm import (
     ANTHROPIC_API_VERSION,
@@ -105,6 +108,41 @@ _BILIBILI_HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://www.bilibili.com/",
 }
+_SUPPORTED_COOKIE_BROWSERS = {
+    "brave",
+    "chrome",
+    "chromium",
+    "edge",
+    "firefox",
+    "opera",
+    "safari",
+    "vivaldi",
+    "whale",
+}
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        raw_url = str(url or "").strip()
+        parsed = urlsplit(raw_url if "://" in raw_url else f"//{raw_url}")
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname in {"youtube.com", "youtu.be"} or hostname.endswith(".youtube.com")
+
+
+def _configure_youtube_runtime(options: dict[str, object], url: str) -> None:
+    if not _is_youtube_url(url):
+        return
+    for runtime_name in ("deno", "node"):
+        runtime_path = shutil.which(runtime_name)
+        if runtime_path:
+            options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+            break
+    # yt-dlp needs a challenge-solver script ("ejs") to pass YouTube's "n"
+    # challenge; without it, only storyboard images are returned and video /
+    # audio formats go missing.  Pull the official solver from GitHub.
+    options["remote_components"] = ["ejs:github"]
 
 
 def _get_ytdlp_classes():
@@ -141,11 +179,59 @@ def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     return kwargs
 
 
+def _kill_process_tree(process: subprocess.Popen) -> None:
+    """Terminate a subprocess *and its entire child tree*.
+
+    On Windows ``Popen.kill()`` only terminates the direct child.  When the
+    command is launched through a venv/uv shim (e.g. ``Scripts\\python.exe``)
+    that spawns the real interpreter, the grandchild keeps running and leaks
+    GPU/CPU after a task is cancelled.  ``taskkill /T`` walks the whole tree;
+    ``process.kill()`` is kept as a portable fallback on non-Windows.
+    """
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                **_windows_hidden_subprocess_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Best-effort cleanup; the portable fallback below still runs.
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
+    process.kill()
+
+
 def _safe_int(value: object) -> int | None:
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    """Coerce LLM numeric fields, tolerating singleton list wrappers."""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return default
+        return _safe_float(value[0], default)
+    if isinstance(value, dict):
+        for key in ("value", "seconds", "start", "time"):
+            if key in value:
+                return _safe_float(value[key], default)
+        return default
+    try:
+        return float(value) if value is not None and str(value).strip() else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _truncate_text(value: str, limit: int) -> str:
@@ -234,7 +320,7 @@ class PipelineSettings:
     multimodal_asr_api_key: str = ""
     multimodal_asr_chunk_duration_seconds: int = 180
     multimodal_asr_max_retries: int = 5
-    funasr_model: str = "paraformer-zh"
+    funasr_model: str = "auto"
     funasr_device: str = "cpu"
     funasr_vad_model: str = "fsmn-vad"
     funasr_punc_model: str = "ct-punc"
@@ -287,6 +373,8 @@ class PipelineSettings:
     summary_chunk_retry_count: int = 2
     ytdlp_cookies_file: str = ""
     ytdlp_cookies_browser: str = ""
+    ytdlp_youtube_cookies_file: str = ""
+    ytdlp_youtube_cookies_browser: str = ""
 
 
 class RealPipelineRunner(PipelineRunner):
@@ -478,7 +566,19 @@ class RealPipelineRunner(PipelineRunner):
         # 如果字幕未获取，使用原 ASR 流程
         if not transcript:
             audio_path = self._download_audio(normalized_url, task_dir, safe_title, emit)
-            transcript, segments = self._transcribe(audio_path, metadata.get("duration"), emit)
+            language = self._detect_video_language(metadata, title)
+            emit(
+                "transcribing",
+                50,
+                f"已检测视频语言：{language}，正在选择对应转写模型",
+                {"language": language},
+            )
+            transcript, segments = self._transcribe(
+                audio_path,
+                metadata.get("duration"),
+                emit,
+                language=language,
+            )
 
         transcript_result = self._export_transcript_snapshot(task_dir, title, transcript, segments)
         emit(
@@ -496,6 +596,7 @@ class RealPipelineRunner(PipelineRunner):
             title,
             emit,
             prompt_preset_id=task_input.options.prompt_preset_id,
+            chunk_cache_path=task_dir / "summary_chunks.json",
         )
         emit("exporting", 97, "正在导出任务结果")
         result = self._export_result(task_dir, title, transcript, segments, summary)
@@ -595,6 +696,7 @@ class RealPipelineRunner(PipelineRunner):
             emit,
             source_kind=source_kind,
             prompt_preset_id=context.task_input.options.prompt_preset_id,
+            chunk_cache_path=task_dir / "summary_chunks.json",
         )
         emit("exporting", 97, "正在导出新的摘要结果")
         result = self._export_result(
@@ -750,6 +852,7 @@ class RealPipelineRunner(PipelineRunner):
             emit,
             prompt_preset_id=task_input.options.prompt_preset_id,
             pegasus_video=pegasus_video,
+            chunk_cache_path=task_dir / "summary_chunks.json",
         )
         emit("exporting", 97, "正在导出任务结果")
         result = self._export_result(
@@ -838,7 +941,8 @@ class RealPipelineRunner(PipelineRunner):
         audio_path: Path,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
     ) -> Transcript:
-        transcript_text, raw_segments = self._transcribe(audio_path, None, emit)
+        language = self._detect_video_language(None, str(media.path.name or ""))
+        transcript_text, raw_segments = self._transcribe(audio_path, None, emit, language=language)
         return transcript_from_legacy(
             transcript_text,
             raw_segments,
@@ -1056,7 +1160,7 @@ class RealPipelineRunner(PipelineRunner):
             segments.append({"start": start_value, "end": end_value, "text": text})
         return segments
 
-    def _base_ydl_options(self) -> dict[str, object]:
+    def _base_ydl_options(self, url: str = "") -> dict[str, object]:
         options: dict[str, object] = {
             "quiet": True,
             "no_warnings": True,
@@ -1067,31 +1171,70 @@ class RealPipelineRunner(PipelineRunner):
             "sleep_interval_requests": 1,
             "socket_timeout": 30,
         }
-        cookie_file = str(
-            self._settings.ytdlp_cookies_file
-            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
-            or os.environ.get("YTDLP_COOKIES_FILE")
-            or ""
-        ).strip()
+        cookie_file = self._pick_cookie_file(url)
         if cookie_file:
             cookie_path = Path(cookie_file).expanduser()
             if cookie_path.exists() and cookie_path.is_file():
                 options["cookiefile"] = str(cookie_path)
             else:
                 logger.warning("yt-dlp cookie file does not exist: %s", cookie_path)
+        else:
+            cookie_browser = self._pick_cookie_browser(url)
+            if cookie_browser in _SUPPORTED_COOKIE_BROWSERS:
+                options["cookiesfrombrowser"] = (cookie_browser,)
+            elif cookie_browser:
+                logger.warning("unsupported yt-dlp cookie browser: %s", cookie_browser)
         return options
 
-    def _raise_ydl_error(self, error: Exception) -> NoReturn:
+    def _pick_cookie_file(self, url: str) -> str:
+        is_youtube = _is_youtube_url(url)
+        if is_youtube:
+            return str(
+                self._settings.ytdlp_youtube_cookies_file
+                or self._settings.ytdlp_cookies_file
+                or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+                or os.environ.get("YTDLP_COOKIES_FILE")
+                or ""
+            ).strip()
+        return str(
+            self._settings.ytdlp_cookies_file
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_FILE")
+            or os.environ.get("YTDLP_COOKIES_FILE")
+            or ""
+        ).strip()
+
+    def _pick_cookie_browser(self, url: str) -> str:
+        is_youtube = _is_youtube_url(url)
+        if is_youtube:
+            return str(
+                self._settings.ytdlp_youtube_cookies_browser
+                or self._settings.ytdlp_cookies_browser
+                or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_BROWSER")
+                or os.environ.get("YTDLP_COOKIES_BROWSER")
+                or ""
+            ).strip().lower()
+        return str(
+            self._settings.ytdlp_cookies_browser
+            or os.environ.get("VIDEO_SUM_YTDLP_COOKIES_BROWSER")
+            or os.environ.get("YTDLP_COOKIES_BROWSER")
+            or ""
+        ).strip().lower()
+
+    def _raise_ydl_error(self, error: Exception, url: str = "") -> NoReturn:
         message = str(error)
+        is_youtube = _is_youtube_url(url)
+        cookie_help = (
+            "请在设置中填写 YouTube Cookies 文件，或通过“YouTube 登录获取”按钮捕获登录态。"
+            if is_youtube
+            else "请在设置中填写 B 站 Cookies 文件，或通过“B 站登录获取”按钮捕获登录态。"
+        )
         if "Could not copy Chrome cookie database" in message:
             raise VideoSumError(
-                "无法读取 Chrome 登录态：yt-dlp 不能复制 Chrome Cookie 数据库。"
-                "请通过 BiliSum 的 B 站登录窗口重新捕获登录态，或按教程导出 cookies.txt 并填写 yt-dlp Cookies 文件。"
+                "无法读取 Chrome 登录态：yt-dlp 不能复制 Chrome Cookie 数据库。" + cookie_help
             ) from error
         if "Failed to decrypt with DPAPI" in message:
             raise VideoSumError(
-                "无法读取浏览器登录态：yt-dlp 解密 Windows 浏览器 Cookie 失败（DPAPI）。"
-                "请通过 BiliSum 的 B 站登录窗口重新捕获登录态，或按教程导出 cookies.txt 并填写 yt-dlp Cookies 文件。"
+                "无法读取浏览器登录态：yt-dlp 解密 Windows 浏览器 Cookie 失败（DPAPI）。" + cookie_help
             ) from error
         if "HTTP Error 412" in message and "BiliBili" in message:
             raise VideoSumError(
@@ -1099,15 +1242,27 @@ class RealPipelineRunner(PipelineRunner):
                 "或通过 BiliSum 的 B 站登录窗口捕获登录态；也可以填写 yt-dlp Cookies 文件 "
                 "/ VIDEO_SUM_YTDLP_COOKIES_FILE。"
             ) from error
+        lowered_message = message.lower()
+        if "[youtube]" in lowered_message and (
+            "sign in to confirm" in lowered_message
+            or "not a bot" in lowered_message
+            or "cookies-from-browser" in lowered_message
+        ):
+            raise VideoSumError(
+                "YouTube 要求登录态才能读取此视频。请在设置中填写 YouTube Cookies 文件，"
+                "或通过“YouTube 登录获取”按钮捕获登录态后重试。"
+            ) from error
         raise VideoSumError(f"Failed to read or download video with yt-dlp: {message}") from error
 
     def _probe_video(self, url: str) -> dict:
         YoutubeDL, DownloadError = _get_ytdlp_classes()
+        options = self._base_ydl_options(url)
+        _configure_youtube_runtime(options, url)
         try:
-            with YoutubeDL(self._base_ydl_options()) as ydl:
+            with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
         except DownloadError as exc:
-            self._raise_ydl_error(exc)
+            self._raise_ydl_error(exc, url)
         if not isinstance(info, dict):
             raise VideoSumError("Failed to probe video metadata.")
         return info
@@ -1214,7 +1369,7 @@ class RealPipelineRunner(PipelineRunner):
                 emit("downloading", 48, "音频提取完成")
 
         options = {
-            **self._base_ydl_options(),
+            **self._base_ydl_options(url),
             "format": "bestaudio/best",
             "outtmpl": output_template,
             "noplaylist": True,
@@ -1228,6 +1383,7 @@ class RealPipelineRunner(PipelineRunner):
                 }
             ],
         }
+        _configure_youtube_runtime(options, url)
         ffmpeg_exe = ffmpeg_location()
         if ffmpeg_exe is not None:
             options["ffmpeg_location"] = str(ffmpeg_exe)
@@ -1239,7 +1395,7 @@ class RealPipelineRunner(PipelineRunner):
             with YoutubeDL(options) as ydl:
                 ydl.download([url])
         except DownloadError as exc:
-            self._raise_ydl_error(exc)
+            self._raise_ydl_error(exc, url)
         candidates = sorted(
             task_dir / p
             for p in glob.glob(
@@ -1316,6 +1472,7 @@ class RealPipelineRunner(PipelineRunner):
         audio_path: Path,
         duration: float | None,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
+        language: str | None = None,
     ) -> tuple[str, list[dict[str, object]]]:
         provider = self._settings.transcription_provider
         if provider == "siliconflow":
@@ -1323,7 +1480,7 @@ class RealPipelineRunner(PipelineRunner):
         if provider == "multimodal":
             return self._transcribe_with_multimodal(audio_path, duration, emit)
         if provider == "funasr":
-            return self._transcribe_with_funasr(audio_path, duration, emit)
+            return self._transcribe_with_funasr(audio_path, duration, emit, language=language)
         return self._transcribe_with_local_whisper(audio_path, duration, emit)
 
     def _transcribe_with_local_whisper(
@@ -1816,47 +1973,135 @@ class RealPipelineRunner(PipelineRunner):
         )
         return self._render_transcript_from_segments(segments), segments
 
+    def _detect_video_language(
+        self,
+        metadata: dict[str, object] | None,
+        title: str = "",
+    ) -> str:
+        """Best-effort language detection for FunASR model selection.
+
+        Prefers the yt-dlp metadata ``language``/``languages`` fields; falls
+        back to CJK-vs-Latin ratio in the title. Returns ``zh``, ``en`` or
+        ``other``.
+        """
+        if metadata:
+            for key in ("language", "lang"):
+                raw = metadata.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    normalized = raw.strip().lower()
+                    if normalized.startswith("zh"):
+                        return "zh"
+                    if normalized.startswith("en"):
+                        return "en"
+            raw_langs = metadata.get("languages")
+            if isinstance(raw_langs, list):
+                for entry in raw_langs:
+                    if isinstance(entry, str):
+                        normalized = entry.strip().lower()
+                        if normalized.startswith("zh"):
+                            return "zh"
+                        if normalized.startswith("en"):
+                            return "en"
+        # Fallback: compare CJK vs ASCII letter ratio in the title.
+        sample = str(title or "").strip()
+        if sample:
+            cjk_count = 0
+            ascii_letters = 0
+            for ch in sample:
+                if "\u4e00" <= ch <= "\u9fff":
+                    cjk_count += 1
+                elif ch.isascii() and ch.isalpha():
+                    ascii_letters += 1
+            total = cjk_count + ascii_letters
+            if total > 0 and cjk_count / total >= 0.5:
+                return "zh"
+            if total > 0 and ascii_letters / total >= 0.5:
+                return "en"
+        return "other"
+
     def _transcribe_with_funasr(
         self,
         audio_path: Path,
         duration: float | None,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
+        language: str | None = None,
+        title: str = "",
     ) -> tuple[str, list[dict[str, object]]]:
         if not self._settings.funasr_available:
             raise TranscriptionConfigurationError(
                 "FunASR is not installed in the current runtime. Install FunASR from Settings or switch to another provider."
             )
 
+        effective_model = resolve_funasr_model(language, self._settings.funasr_model)
+        if effective_model != self._settings.funasr_model:
+            logger.info(
+                "funasr auto model selection language=%s configured=%s resolved=%s",
+                language,
+                self._settings.funasr_model,
+                effective_model,
+            )
+
+        # The English model (paraformer-en) bundles its own VAD + punctuation.
+        # Forcing the Chinese ct-punc on its English output crashes with
+        # "piece id is out of range", so drop redundant auxiliary models.
+        vad_model, punc_model, spk_model = resolve_funasr_aux_models(
+            effective_model,
+            vad_model=self._settings.funasr_vad_model,
+            punc_model=self._settings.funasr_punc_model,
+            spk_model=self._settings.funasr_spk_model,
+        )
+        # SenseVoiceSmall can add punctuation through its native ITN mode.
+        # Running the external ct-punc over a long 18-minute transcript makes
+        # the whole VAD pipeline appear stuck after ASR, so use native ITN for
+        # explicitly detected languages and avoid the second full-text pass.
+        if (
+            effective_model in {"iic/SenseVoiceSmall", "SenseVoiceSmall"}
+            and str(language or "").strip().lower() in {"en", "zh", "ja", "ko", "yue"}
+        ):
+            punc_model = ""
+        if (vad_model, punc_model, spk_model) != (
+            self._settings.funasr_vad_model,
+            self._settings.funasr_punc_model,
+            self._settings.funasr_spk_model,
+        ):
+            logger.info(
+                "funasr aux models adjusted model=%s vad=%s punc=%s spk=%s",
+                effective_model,
+                vad_model or "none",
+                punc_model or "none",
+                spk_model or "none",
+            )
+
         attempts = [
             {
-                "model": self._settings.funasr_model,
+                "model": effective_model,
                 "device": self._settings.funasr_device,
-                "vad_model": self._settings.funasr_vad_model,
-                "punc_model": self._settings.funasr_punc_model,
-                "spk_model": self._settings.funasr_spk_model,
+                "vad_model": vad_model,
+                "punc_model": punc_model,
+                "spk_model": spk_model,
                 "hub": self._settings.funasr_hub,
                 "hotword": self._settings.funasr_hotword,
-                "message": f"正在加载 FunASR 模型 {self._settings.funasr_model}",
+                "message": f"正在加载 FunASR 模型 {effective_model}",
             }
         ]
 
         if self._settings.funasr_device == "cpu":
             attempts.append(
                 {
-                    "model": self._settings.funasr_model,
+                    "model": effective_model,
                     "device": "cpu",
                     "vad_model": "",
                     "punc_model": "",
                     "spk_model": "",
                     "hub": self._settings.funasr_hub,
                     "hotword": self._settings.funasr_hotword,
-                    "message": f"兼容模式重试，正在加载 FunASR 模型 {self._settings.funasr_model}（禁用 VAD/PUNC）",
+                    "message": f"兼容模式重试，正在加载 FunASR 模型 {effective_model}（禁用 VAD/PUNC）",
                 }
             )
         elif self._settings.funasr_device == "cuda":
             attempts.append(
                 {
-                    "model": self._settings.funasr_model,
+                    "model": effective_model,
                     "device": "cpu",
                     "vad_model": "",
                     "punc_model": "",
@@ -1892,6 +2137,13 @@ class RealPipelineRunner(PipelineRunner):
             )
             emit("transcribing", 58, "开始转写音频内容")
             try:
+                # SenseVoice accepts en/zh/ja/ko/yue; "other" is not a valid
+                # language code, so omit it and let the model use auto.
+                transcribe_language = (
+                    language
+                    if language and str(language).lower() not in {"other", "auto"}
+                    else ""
+                )
                 transcript, segments = self._run_funasr_subprocess(
                     audio_path=audio_path,
                     duration=duration,
@@ -1903,6 +2155,7 @@ class RealPipelineRunner(PipelineRunner):
                     spk_model=str(attempt.get("spk_model", "")),
                     hub=str(attempt.get("hub", "ms")),
                     hotword=str(attempt.get("hotword", "")),
+                    language=transcribe_language,
                 )
                 logger.info(
                     "funasr transcription finished audio=%s segments=%d transcript_chars=%d attempt=%s",
@@ -2112,6 +2365,10 @@ class RealPipelineRunner(PipelineRunner):
         timeout_seconds = max(30 * 60, int((duration or 0) * 8) + 10 * 60)
         deadline = time.monotonic() + timeout_seconds
         while process.poll() is None:
+            if self._cancelled:
+                _kill_process_tree(process)
+                process.wait(timeout=5)
+                raise VideoSumError("Task cancelled by user.")
             prev_offset = progress_offset
             progress_offset = self._replay_transcription_progress(progress_path, progress_offset, emit)
             if progress_offset == prev_offset:
@@ -2119,7 +2376,7 @@ class RealPipelineRunner(PipelineRunner):
             else:
                 _whisper_last_reported_stderr = len(_whisper_stderr_lines)
             if time.monotonic() > deadline:
-                process.kill()
+                _kill_process_tree(process)
                 _drain_stdout_thread.join(timeout=2)
                 _drain_stderr_thread.join(timeout=2)
                 stdout = "".join(_whisper_stdout_lines).strip()
@@ -2242,6 +2499,7 @@ class RealPipelineRunner(PipelineRunner):
         spk_model: str,
         hub: str,
         hotword: str,
+        language: str = "",
     ) -> tuple[str, list[dict[str, object]]]:
         progress_path = audio_path.with_name("funasr_worker_progress.jsonl")
         output_path = audio_path.with_name("funasr_worker_result.json")
@@ -2261,6 +2519,7 @@ class RealPipelineRunner(PipelineRunner):
             hotword=hotword,
             progress_path=progress_path,
             output_path=output_path,
+            language=language,
         )
         if duration is not None:
             command.extend(["--duration", str(duration)])
@@ -2343,34 +2602,55 @@ class RealPipelineRunner(PipelineRunner):
 
         progress_offset = 0
         timeout_seconds = max(30 * 60, int((duration or 0) * 8) + 10 * 60)
-        deadline = time.monotonic() + timeout_seconds
-        stall_start = time.monotonic()
-        stall_timeout = 600  # 10 minutes with no progress -> abort
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        last_activity_at = started_at
+        last_heartbeat_at = started_at
+        heartbeat_progress = 62
+        stall_timeout = 600  # 10 minutes with no child output -> abort
         while process.poll() is None:
             if self._cancelled:
-                process.kill()
+                _kill_process_tree(process)
                 process.wait(timeout=5)
                 raise VideoSumError("Task cancelled by user.")
+            now = time.monotonic()
             prev_offset = progress_offset
+            previous_stderr_count = len(_funasr_stderr_lines)
             progress_offset = self._replay_transcription_progress(progress_path, progress_offset, emit)
             if progress_offset == prev_offset:
                 _emit_stderr_progress()
             else:
                 _funasr_last_reported_stderr = len(_funasr_stderr_lines)
-            # Stall detection: if the subprocess produces zero progress
-            # for too long it is probably stuck (waiting for a lock, failed
-            # download, etc.) — abort early instead of waiting the full 30 min.
-            if progress_offset == 0:
-                if time.monotonic() - stall_start > stall_timeout:
-                    process.kill()
-                    raise VideoSumError(
-                        "FunASR subprocess produced no progress after 10 minutes. "
-                        "Check network or ModelScope availability."
+                last_activity_at = now
+            if len(_funasr_stderr_lines) > previous_stderr_count:
+                last_activity_at = now
+
+            # FunASR only reports real progress at batch boundaries. Emit a
+            # clearly labelled heartbeat while a long VAD/ASR batch is being
+            # processed, so the UI does not appear frozen at 62%.
+            if progress_offset == prev_offset and now - last_heartbeat_at >= 10:
+                estimated_seconds = max(60.0, float(duration or 0) * 0.35)
+                estimated_progress = min(82, 62 + int((now - started_at) / estimated_seconds * 20))
+                if estimated_progress > heartbeat_progress:
+                    heartbeat_progress = estimated_progress
+                    emit(
+                        "transcribing",
+                        heartbeat_progress,
+                        f"FunASR 正在处理音频（已运行 {int(now - started_at)} 秒，等待下一批结果）",
+                        {"heartbeat": True, "elapsed_seconds": int(now - started_at)},
                     )
-            else:
-                stall_start = time.monotonic()
-            if time.monotonic() > deadline:
-                process.kill()
+                last_heartbeat_at = now
+
+            # A child that emits neither structured progress nor stderr for
+            # this long is stuck; do not leave a GPU worker orphaned forever.
+            if now - last_activity_at > stall_timeout:
+                _kill_process_tree(process)
+                raise VideoSumError(
+                    "FunASR subprocess produced no progress/output after 10 minutes. "
+                    "Check network, ModelScope, or the audio/model configuration."
+                )
+            if now > deadline:
+                _kill_process_tree(process)
                 _drain_stdout_thread.join(timeout=2)
                 _drain_stderr_thread.join(timeout=2)
                 stdout = "".join(_funasr_stdout_lines).strip()
@@ -2454,6 +2734,7 @@ class RealPipelineRunner(PipelineRunner):
         hotword: str,
         progress_path: Path,
         output_path: Path,
+        language: str = "",
     ) -> list[str]:
         runtime_python = runtime_python_executable(self._settings.runtime_channel)
         if runtime_python is None:
@@ -2486,6 +2767,8 @@ class RealPipelineRunner(PipelineRunner):
                 str(output_path),
             ]
         )
+        if language and language.lower() != "auto":
+            command.extend(["--language", language])
         return command
 
     def _should_retry_transcription(self, error: VideoSumError) -> bool:
@@ -2527,6 +2810,7 @@ class RealPipelineRunner(PipelineRunner):
         source_kind: str | None = None,
         prompt_preset_id: str | None = None,
         pegasus_video: dict[str, str] | None = None,
+        chunk_cache_path: Path | None = None,
     ) -> dict[str, object]:
         emit(
             "summarizing",
@@ -2545,23 +2829,18 @@ class RealPipelineRunner(PipelineRunner):
                 len(segments),
             )
             try:
+                summary_kwargs: dict[str, object] = {"source_kind": source_kind}
                 if str(prompt_preset_id or "").strip():
-                    summary = self._summarize_with_llm(
-                        transcript,
-                        segments,
-                        title,
-                        emit,
-                        source_kind=source_kind,
-                        prompt_preset_id=prompt_preset_id,
-                    )
-                else:
-                    summary = self._summarize_with_llm(
-                        transcript,
-                        segments,
-                        title,
-                        emit,
-                        source_kind=source_kind,
-                    )
+                    summary_kwargs["prompt_preset_id"] = prompt_preset_id
+                if chunk_cache_path is not None:
+                    summary_kwargs["chunk_cache_path"] = chunk_cache_path
+                summary = self._summarize_with_llm(
+                    transcript,
+                    segments,
+                    title,
+                    emit,
+                    **summary_kwargs,
+                )
                 used_llm_summary = True
             except (LLMAuthenticationError, LLMConfigurationError) as exc:
                 logger.warning("llm unavailable, fallback to rule summary reason=%s", exc)
@@ -2683,6 +2962,102 @@ class RealPipelineRunner(PipelineRunner):
             return "开始生成 LLM 摘要"
         return "开始生成本地规则摘要"
 
+    def _is_local_ollama(self, base_url: str) -> bool:
+        parsed = urlsplit(str(base_url or ""))
+        return parsed.hostname in {"127.0.0.1", "localhost", "::1"} and (parsed.port or 80) == 11434
+
+    def _resolve_summary_chunk_model(self, base_url: str) -> str:
+        """Use a smaller local model for parallel chunk work when available.
+
+        The final merge and knowledge-note requests continue using the main
+        model. This keeps quality-critical synthesis on qwen3:14b while the
+        embarrassingly-parallel chunk pass uses qwen3:8b on this 16GB GPU.
+        """
+        main_model = str(self._settings.llm_model or "").strip()
+        if not self._is_local_ollama(base_url) or main_model.lower() != "qwen3:14b":
+            return main_model
+        parsed = urlsplit(base_url)
+        root_url = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+                response = client.get(f"{root_url}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+            names = {
+                str(item.get("name") or "").strip()
+                for item in payload.get("models", [])
+                if isinstance(item, dict)
+            }
+            if "qwen3:8b" in names:
+                return "qwen3:8b"
+            if "qwen3:4b" in names:
+                return "qwen3:4b"
+        except Exception as exc:
+            logger.info("summary chunk model discovery skipped error=%s", exc)
+        return main_model
+
+    def _summary_chunk_cache_key(self, chunk: dict[str, object]) -> str:
+        payload = json.dumps(
+            {
+                "transcript": chunk.get("transcript", ""),
+                "segments_json": chunk.get("segments_json", ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _load_summary_chunk_cache(
+        self,
+        cache_path: Path | None,
+        *,
+        model_name: str,
+        chunks: list[dict[str, object]],
+    ) -> dict[int, dict[str, object]]:
+        if cache_path is None or not cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if payload.get("version") != 1 or payload.get("model") != model_name:
+                return {}
+            by_index = {int(chunk["index"]): chunk for chunk in chunks}
+            cached: dict[int, dict[str, object]] = {}
+            for raw_index, item in (payload.get("items") or {}).items():
+                index = int(raw_index)
+                if not isinstance(item, dict) or index not in by_index:
+                    continue
+                if item.get("cache_key") != self._summary_chunk_cache_key(by_index[index]):
+                    continue
+                summary = item.get("summary")
+                if isinstance(summary, dict):
+                    cached[index] = summary
+            return cached
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("summary chunk cache ignored path=%s", cache_path)
+            return {}
+
+    def _save_summary_chunk_cache(
+        self,
+        cache_path: Path | None,
+        *,
+        model_name: str,
+        chunks: list[dict[str, object]],
+        cached: dict[int, dict[str, object]],
+    ) -> None:
+        if cache_path is None:
+            return
+        items = {
+            str(index): {
+                "cache_key": self._summary_chunk_cache_key(next(chunk for chunk in chunks if int(chunk["index"]) == index)),
+                "summary": summary,
+            }
+            for index, summary in cached.items()
+        }
+        self._write_json_atomic(
+            cache_path,
+            {"version": 1, "model": model_name, "chunk_count": len(chunks), "items": items},
+        )
+
     def _summarize_with_llm(
         self,
         transcript: str,
@@ -2691,6 +3066,7 @@ class RealPipelineRunner(PipelineRunner):
         emit: Callable[[str, int, str, dict[str, object] | None], None],
         source_kind: str | None = None,
         prompt_preset_id: str | None = None,
+        chunk_cache_path: Path | None = None,
     ) -> dict[str, object]:
         base_url = (self._settings.llm_base_url or "").rstrip("/")
         if not base_url or not self._settings.llm_model:
@@ -2707,74 +3083,125 @@ class RealPipelineRunner(PipelineRunner):
                     "segments_json": json.dumps(segments, ensure_ascii=False),
                 }
             ]
+        chunk_count = len(chunks)
+        chunk_model = self._resolve_summary_chunk_model(base_url)
+        local_ollama = self._is_local_ollama(base_url)
+        configured_concurrency = max(1, int(self._settings.summary_chunk_concurrency))
+        concurrency = configured_concurrency
+        if local_ollama and chunk_model != self._settings.llm_model:
+            # qwen3:8b fits two concurrent contexts comfortably on the 16GB
+            # GPU; qwen3:14b remains reserved for the quality-critical merge.
+            concurrency = max(2, configured_concurrency)
+        retry_count = max(0, int(self._settings.summary_chunk_retry_count))
+        request_timeout = 180.0
+        transport_retry_count: int | None = None
+        if local_ollama:
+            # Do not queue duplicate transport requests behind a slow Ollama
+            # request. A non-timeout protocol error gets one logical retry,
+            # but a timeout is skipped immediately instead of adding six
+            # minutes of duplicate work while Ollama is still busy.
+            retry_count = min(retry_count, 1)
+            transport_retry_count = 0
+        cached = self._load_summary_chunk_cache(
+            chunk_cache_path,
+            model_name=chunk_model,
+            chunks=chunks,
+        )
+        pending_chunks = [chunk for chunk in chunks if int(chunk["index"]) not in cached]
+        partial_summaries: list[dict[str, object]] = list(cached.values())
+        completed = len(cached)
         logger.info(
-            "llm summary chunk plan model=%s chunks=%d target_chars=%d overlap_segments=%d",
+            "llm summary chunk plan main_model=%s chunk_model=%s chunks=%d pending=%d target_chars=%d overlap_segments=%d concurrency=%d retry_count=%d",
             self._settings.llm_model,
-            len(chunks),
+            chunk_model,
+            chunk_count,
+            len(pending_chunks),
             self._settings.summary_chunk_target_chars,
             self._settings.summary_chunk_overlap_segments,
+            concurrency,
+            retry_count,
         )
-
-        partial_summaries: list[dict[str, object]] = []
-        chunk_count = len(chunks)
-        concurrency = max(1, int(self._settings.summary_chunk_concurrency))
-        retry_count = max(0, int(self._settings.summary_chunk_retry_count))
         emit(
             "summarizing",
-            91,
-            f"正在并发汇总 {chunk_count} 个内容块",
-            {"chunk_count": chunk_count, "concurrency": concurrency},
+            min(94, 91 + max(0, math.floor(completed * 3 / max(1, chunk_count)))),
+            f"正在并发汇总 {chunk_count} 个内容块（模型：{chunk_model}，并发：{concurrency}）",
+            {
+                "chunk_count": chunk_count,
+                "pending_chunks": len(pending_chunks),
+                "completed_chunks": completed,
+                "concurrency": concurrency,
+                "chunk_model": chunk_model,
+                "resumed": bool(cached),
+            },
         )
-        completed = 0
         failures: list[str] = []
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            future_map = {
-                executor.submit(
-                    self._request_llm_summary_chunk,
-                    base_url,
-                    title,
-                    chunk,
-                    chunk_count,
-                    retry_count,
-                    system_prompt_override,
-                    user_prompt_override,
-                ): chunk
-                for chunk in chunks
-            }
-            for future in as_completed(future_map):
-                chunk = future_map[future]
-                chunk_index = int(chunk["index"])
-                try:
-                    partial = future.result()
-                    partial_summaries.append(partial)
-                    completed += 1
-                    progress = min(94, 91 + max(0, math.floor(completed * 3 / max(1, chunk_count))))
-                    emit(
-                        "summarizing",
-                        progress,
-                        f"已完成第 {chunk_index}/{chunk_count} 个内容块",
-                        {"chunk_index": chunk_index, "chunk_count": chunk_count, "completed_chunks": completed},
-                    )
-                except VideoSumError as exc:
-                    failures.append(f"chunk={chunk_index}: {exc}")
-                    completed += 1
-                    logger.warning(
-                        "llm summary chunk skipped after retries model=%s chunk=%d/%d error=%s",
-                        self._settings.llm_model,
-                        chunk_index,
+        cache_lock = threading.Lock()
+        if pending_chunks:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                future_map = {
+                    executor.submit(
+                        self._request_llm_summary_chunk,
+                        base_url,
+                        title,
+                        chunk,
                         chunk_count,
-                        exc,
-                    )
-                    emit(
-                        "summarizing",
-                        min(94, 91 + max(0, math.floor(completed * 3 / max(1, chunk_count)))),
-                        f"第 {chunk_index}/{chunk_count} 个内容块失败，已跳过继续",
-                        {"chunk_index": chunk_index, "chunk_count": chunk_count, "error": str(exc)},
-                    )
+                        retry_count,
+                        system_prompt_override,
+                        user_prompt_override,
+                        chunk_model,
+                        request_timeout,
+                        transport_retry_count,
+                    ): chunk
+                    for chunk in pending_chunks
+                }
+                for future in as_completed(future_map):
+                    chunk = future_map[future]
+                    chunk_index = int(chunk["index"])
+                    try:
+                        partial = future.result()
+                        partial_summaries.append(partial)
+                        with cache_lock:
+                            cached[chunk_index] = partial
+                            self._save_summary_chunk_cache(
+                                chunk_cache_path,
+                                model_name=chunk_model,
+                                chunks=chunks,
+                                cached=cached,
+                            )
+                        completed += 1
+                        progress = min(94, 91 + max(0, math.floor(completed * 3 / max(1, chunk_count))))
+                        emit(
+                            "summarizing",
+                            progress,
+                            f"已完成第 {chunk_index}/{chunk_count} 个内容块",
+                            {"chunk_index": chunk_index, "chunk_count": chunk_count, "completed_chunks": completed, "chunk_model": chunk_model},
+                        )
+                    except VideoSumError as exc:
+                        failures.append(f"chunk={chunk_index}: {exc}")
+                        completed += 1
+                        logger.warning(
+                            "llm summary chunk skipped after retries model=%s chunk=%d/%d error=%s",
+                            chunk_model,
+                            chunk_index,
+                            chunk_count,
+                            exc,
+                        )
+                        emit(
+                            "summarizing",
+                            min(94, 91 + max(0, math.floor(completed * 3 / max(1, chunk_count)))),
+                            f"第 {chunk_index}/{chunk_count} 个内容块失败，已跳过继续",
+                            {"chunk_index": chunk_index, "chunk_count": chunk_count, "error": str(exc)},
+                        )
 
         partial_summaries.sort(key=lambda item: int(item.get("chunk_index") or 0))
         if not partial_summaries:
             raise VideoSumError("All LLM summary chunks failed.")
+        coverage_index = self._build_summary_coverage_index(partial_summaries)
+        logger.info(
+            "llm summary coverage index chunks=%d chars=%d",
+            len(partial_summaries),
+            len(coverage_index),
+        )
 
         total_prompt_tokens = sum((_safe_int(item.get("llm_prompt_tokens")) or 0) for item in partial_summaries)
         total_completion_tokens = sum((_safe_int(item.get("llm_completion_tokens")) or 0) for item in partial_summaries)
@@ -2820,6 +3247,9 @@ class RealPipelineRunner(PipelineRunner):
         merged["llm_prompt_tokens"] = total_prompt_tokens + (_safe_int(merged.get("llm_prompt_tokens")) or 0)
         merged["llm_completion_tokens"] = total_completion_tokens + (_safe_int(merged.get("llm_completion_tokens")) or 0)
         merged["llm_total_tokens"] = total_tokens + (_safe_int(merged.get("llm_total_tokens")) or 0)
+        # Keep a compact, all-chunk coverage index for the knowledge-note
+        # pass. It is internal provenance, not a user-facing claim list.
+        merged["coverageIndex"] = coverage_index
         return merged
 
     def _summarize_aggregate_series_with_llm(
@@ -2864,13 +3294,17 @@ class RealPipelineRunner(PipelineRunner):
         retry_count: int,
         system_prompt_override: str | None = None,
         user_prompt_override: str | None = None,
+        model_name: str | None = None,
+        request_timeout: float = 180,
+        transport_retry_count: int | None = None,
     ) -> dict[str, object]:
         chunk_index = int(chunk["index"])
+        effective_model = str(model_name or self._settings.llm_model).strip()
         last_error: Exception | None = None
         for attempt in range(retry_count + 1):
             logger.info(
                 "llm summary chunk request model=%s chunk=%d/%d attempt=%d transcript_chars=%d segments_json_chars=%d",
-                self._settings.llm_model,
+                effective_model,
                 chunk_index,
                 chunk_count,
                 attempt + 1,
@@ -2886,7 +3320,10 @@ class RealPipelineRunner(PipelineRunner):
                         segments_excerpt=str(chunk["segments_json"]),
                         system_prompt_override=system_prompt_override,
                         user_prompt_override=user_prompt_override,
+                        model_name=effective_model,
                     ),
+                    timeout=request_timeout,
+                    retry_count=transport_retry_count,
                 )
                 partial["chunk_index"] = chunk_index
                 partial["chunk_start"] = float(chunk.get("chunk_start") or 0)
@@ -2897,12 +3334,14 @@ class RealPipelineRunner(PipelineRunner):
                 last_error = exc
                 logger.warning(
                     "llm summary chunk request failed model=%s chunk=%d/%d attempt=%d error=%s",
-                    self._settings.llm_model,
+                    effective_model,
                     chunk_index,
                     chunk_count,
                     attempt + 1,
                     exc,
                 )
+                if transport_retry_count == 0 and isinstance(exc, httpx.TimeoutException):
+                    break
         raise VideoSumError(str(last_error) if last_error else f"Chunk {chunk_index} failed.")
 
     def _request_llm_json(
@@ -3081,6 +3520,7 @@ class RealPipelineRunner(PipelineRunner):
         segments_excerpt: str,
         system_prompt_override: str | None = None,
         user_prompt_override: str | None = None,
+        model_name: str | None = None,
     ) -> dict[str, object]:
         messages = self._build_summary_messages(
             title,
@@ -3092,7 +3532,7 @@ class RealPipelineRunner(PipelineRunner):
         messages = self._ensure_json_keyword_in_messages(messages)
         # Qwen mixed-thinking models may reject json_object mode when thinking is enabled.
         return {
-            "model": self._settings.llm_model,
+            "model": str(model_name or self._settings.llm_model),
             "messages": messages,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
@@ -3253,6 +3693,18 @@ P 数索引：
 
 分段数据节选：
 {segments_json}"""
+        rendered_user_prompt = self._render_user_prompt_template(
+            user_template,
+            title=title,
+            transcript_excerpt=transcript_excerpt,
+            segments_excerpt=segments_excerpt,
+        )
+        if not str(user_prompt_override or "").strip():
+            rendered_user_prompt += (
+                "\n\n内容覆盖要求：输入的分块素材按时间顺序覆盖整段视频。"
+                "必须优先保留每个分块中的事实、步骤、案例、失败、修正、限制和结论；"
+                "不能只总结开头和结尾，不能把未提供的数据、数值、命令或工具名称补写成事实。"
+            )
         return [
             {
                 "role": "system",
@@ -3260,12 +3712,7 @@ P 数索引：
             },
             {
                 "role": "user",
-                "content": self._render_user_prompt_template(
-                    user_template,
-                    title=title,
-                    transcript_excerpt=transcript_excerpt,
-                    segments_excerpt=segments_excerpt,
-                ),
+                "content": rendered_user_prompt,
             },
         ]
 
@@ -3300,6 +3747,20 @@ P 数索引：
             if self._settings.knowledge_note_user_prompt_template.strip()
             else DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE
         )
+        rendered_user_prompt = self._render_user_prompt_template(
+            user_template,
+            title=title,
+            transcript_excerpt=transcript_excerpt,
+            segments_excerpt=segments_excerpt,
+            summary_json=summary_json,
+        )
+        rendered_user_prompt += (
+            "\n\n覆盖完整性要求（必须遵守）：\n"
+            "1. `summary_json.coverageIndex` 是按时间顺序覆盖全部转写内容块的索引，不是可选参考。\n"
+            "2. 知识笔记必须覆盖索引中的每个内容块；可以合并相邻或同主题内容，但不能因为篇幅省略中间内容。\n"
+            "3. 对每个内容块保留至少一个事实、观点、案例、步骤、结果或限制；不确定的实体必须标为不确定，禁止补写输入中没有的数值、命令、模型或结论。\n"
+            "4. 章节标题和正文要保留真实时间锚点（使用输入中的时间），便于回看和审计。"
+        )
         return [
             {
                 "role": "system",
@@ -3307,13 +3768,7 @@ P 数索引：
             },
             {
                 "role": "user",
-                "content": self._render_user_prompt_template(
-                    user_template,
-                    title=title,
-                    transcript_excerpt=transcript_excerpt,
-                    segments_excerpt=segments_excerpt,
-                    summary_json=summary_json,
-                ),
+                "content": rendered_user_prompt,
             },
         ]
 
@@ -3454,10 +3909,11 @@ P 数索引：
                     "overview": summary.get("overview"),
                     "bulletPoints": summary.get("bulletPoints"),
                     "chapters": summary.get("chapters"),
+                    "coverageIndex": summary.get("coverageIndex", ""),
                 },
                 ensure_ascii=False,
             ),
-            2400,
+            6200,
         )
         logger.info(
             "llm knowledge note request model=%s transcript_chars=%d segments=%d summary_chars=%d",
@@ -3640,7 +4096,13 @@ P 数索引：
         )
         enhanced_note_path.write_text(enhanced_note_markdown, encoding="utf-8")
         self._write_json_atomic(insert_plan_path, insert_plan)
-        status = "ready" if enhanced_note_markdown.strip() and insert_plan.get("insertions") else "partial" if frames else "failed"
+        insertions = [item for item in insert_plan.get("insertions", []) if isinstance(item, dict)]
+        inserted_count = sum(
+            1
+            for insertion in insertions
+            if (image := str(insertion.get("markdown_image") or "").strip()) and image in enhanced_note_markdown
+        )
+        status = "ready" if enhanced_note_markdown.strip() and insertions and inserted_count == len(insertions) else "partial" if frames else "failed"
         context = self._build_visual_context_payload(
             task_id=task_id,
             status=status,
@@ -3654,7 +4116,7 @@ P 数索引：
             keyframe_plan_path=keyframe_plan_path,
             insert_plan_path=insert_plan_path,
             mode=mode,
-            insert_count=len(insert_plan.get("insertions", [])) if isinstance(insert_plan.get("insertions"), list) else 0,
+            insert_count=inserted_count,
         )
         self._write_json_atomic(context_path, context)
         return context, enhanced_note_path, context_path
@@ -3950,7 +4412,7 @@ P 数索引：
         return timestamps or self._choose_visual_timestamps(result)
 
     def _attach_visual_keyframe_plan(self, frames: list[dict[str, object]], keyframes: list[dict[str, object]]) -> None:
-        for frame, planned in zip(frames, keyframes):
+        for frame, planned in zip(frames, keyframes, strict=False):
             frame["anchor_heading"] = str(planned.get("anchor_heading") or "").strip()
             frame["planned_concept"] = str(planned.get("concept") or "").strip()
             frame["planned_reason"] = str(planned.get("reason") or "").strip()
@@ -3989,8 +4451,12 @@ P 数索引：
         ensure_directory(output_dir)
         output_template = str(output_dir / f"{safe_title}.visual.%(ext)s")
         height = self._visual_download_height()
+        # Pass the URL into _base_ydl_options so YouTube-specific cookies are
+        # attached. Without this argument the base options are built with an
+        # empty URL, so ``_pick_cookie_file`` silently omits youtube.txt and
+        # YouTube rejects visual downloads as bot traffic.
         options = {
-            **self._base_ydl_options(),
+            **self._base_ydl_options(url),
             "format": (
                 f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={height}]+bestaudio/"
@@ -3999,6 +4465,7 @@ P 数索引：
             "outtmpl": output_template,
             "noplaylist": True,
         }
+        _configure_youtube_runtime(options, url)
         ffmpeg_exe = ffmpeg_location()
         if ffmpeg_exe is not None:
             options["ffmpeg_location"] = str(ffmpeg_exe)
@@ -4007,7 +4474,7 @@ P 数索引：
             with YoutubeDL(options) as ydl:
                 ydl.download([url])
         except DownloadError as exc:
-            self._raise_ydl_error(exc)
+            self._raise_ydl_error(exc, url)
         candidates = sorted(
             (Path(p) for p in glob.glob(
                 f"{glob.escape(str(output_dir / safe_title))}.visual.*"
@@ -4550,28 +5017,40 @@ P 数索引：
         return content
 
     def _compose_visual_note_locally(self, knowledge_note_markdown: str, insert_plan: dict[str, object]) -> str:
-        insertions = [item for item in insert_plan.get("insertions", []) if isinstance(item, dict)]
-        if not insertions:
+        pending_insertions = [item for item in insert_plan.get("insertions", []) if isinstance(item, dict)]
+        if not pending_insertions:
             return knowledge_note_markdown
         lines = knowledge_note_markdown.splitlines()
         output: list[str] = []
-        insertion_index = 0
         for line in lines:
             stripped = line.strip()
-            is_heading = stripped.startswith("#")
             output.append(line)
-            if insertion_index >= len(insertions):
-                continue
-            current = insertions[insertion_index]
-            anchor = str(current.get("anchor_heading") or current.get("chapter_title") or "").strip()
-            if not is_heading or not anchor:
+            if not stripped.startswith("#") or not pending_insertions:
                 continue
             heading_text = re.sub(r"^#+\s*", "", stripped).strip()
-            shorter, longer = sorted((len(anchor), len(heading_text)))
-            if (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6:
-                output.extend(self._format_visual_insertion_markdown(current))
-                insertion_index += 1
+            matched_index = next(
+                (
+                    index
+                    for index, insertion in enumerate(pending_insertions)
+                    if self._visual_insertion_matches_heading(insertion, heading_text)
+                ),
+                None,
+            )
+            if matched_index is not None:
+                output.extend(self._format_visual_insertion_markdown(pending_insertions.pop(matched_index)))
+
+        if pending_insertions:
+            output.extend(["", "## 图文笔记素材", ""])
+            for insertion in pending_insertions:
+                output.extend(self._format_visual_insertion_markdown(insertion))
         return "\n".join(output).strip()
+
+    def _visual_insertion_matches_heading(self, insertion: dict[str, object], heading_text: str) -> bool:
+        anchor = str(insertion.get("anchor_heading") or insertion.get("chapter_title") or "").strip()
+        if not anchor:
+            return False
+        shorter, longer = sorted((len(anchor), len(heading_text)))
+        return (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6
 
     def _format_visual_insertion_markdown(self, insertion: dict[str, object]) -> list[str]:
         image = str(insertion.get("markdown_image") or "").strip()
@@ -4803,7 +5282,7 @@ P 数索引：
         chapters = [
             {
                 "title": str(item.get("title") or "").strip(),
-                "start": float(item.get("start") or 0),
+                "start": _safe_float(item.get("start")),
                 "summary": str(item.get("summary") or "").strip(),
             }
             for item in result.timeline
@@ -4840,7 +5319,125 @@ P 数索引：
         if len(root_node.children) > 8:
             root_node.children = root_node.children[:8]
 
+        if self._mindmap_needs_expansion(root_node, chapters, result):
+            logger.warning(
+                "mindmap payload too sparse; building chapter-backed fallback title=%s themes=%d chapters=%d",
+                title,
+                len(root_node.children),
+                len(chapters),
+            )
+            root_node = self._build_chapter_backed_mindmap(
+                title=title,
+                result=result,
+                chapters=chapters,
+                root_id=root_id,
+            )
+
         return TaskMindMap(version=1, title=str(payload.get("title") or title).strip() or title, root=root_node.id, nodes=[root_node])
+
+    def _mindmap_needs_expansion(
+        self,
+        root_node: MindMapNode,
+        chapters: list[dict[str, object]],
+        result: TaskResult,
+    ) -> bool:
+        """Reject an apparently valid but content-empty/sparse LLM tree."""
+        if len(chapters) < 2:
+            return False
+        leaves: list[MindMapNode] = []
+        themes_with_children = 0
+
+        def visit(node: MindMapNode, depth: int) -> None:
+            nonlocal themes_with_children
+            if depth == 1 and node.children:
+                themes_with_children += 1
+            if node.type == "leaf" or not node.children:
+                leaves.append(node)
+                return
+            for child in node.children:
+                visit(child, depth + 1)
+
+        for child in root_node.children:
+            visit(child, 1)
+        expected_themes = min(8, max(3, len(chapters)))
+        expected_leaves = min(12, max(6, len(chapters) * 2))
+        return (
+            len(root_node.children) < min(3, expected_themes)
+            or themes_with_children < min(3, expected_themes)
+            or len(leaves) < expected_leaves
+        )
+
+    def _build_chapter_backed_mindmap(
+        self,
+        *,
+        title: str,
+        result: TaskResult,
+        chapters: list[dict[str, object]],
+        root_id: str,
+    ) -> MindMapNode:
+        """Build a conservative non-LLM fallback that preserves chapter coverage."""
+        used_ids: set[str] = {root_id}
+        root = MindMapNode(
+            id=root_id,
+            label=title or "视频知识结构",
+            type="root",
+            summary=_truncate_text(result.overview or title, 360),
+            children=[],
+            time_anchor=None,
+            source_chapter_titles=[],
+            source_chapter_starts=[],
+        )
+        key_points = [str(point).strip() for point in result.key_points if str(point).strip()]
+        for chapter_index, chapter in enumerate(chapters[:8], start=1):
+            chapter_title = str(chapter.get("title") or f"内容主题 {chapter_index}").strip()
+            chapter_start = _safe_float(chapter.get("start"))
+            chapter_summary = str(chapter.get("summary") or "").strip()
+            theme_id = self._normalize_mindmap_node_id(
+                f"theme-{chapter_index}", chapter_title, "theme", used_ids
+            )
+            theme = MindMapNode(
+                id=theme_id,
+                label=self._normalize_content_title(
+                    chapter_title,
+                    fallback_text=chapter_summary,
+                    fallback_prefix="主题",
+                    fallback_index=chapter_index,
+                ),
+                type="theme",
+                summary=_truncate_text(chapter_summary, 360),
+                children=[],
+                time_anchor=None,
+                source_chapter_titles=[chapter_title],
+                source_chapter_starts=[chapter_start],
+            )
+            detail_texts = [
+                part.strip()
+                for part in re.split(r"[。！？!?；;\\n]+", chapter_summary)
+                if part.strip()
+            ]
+            if chapter_index <= len(key_points):
+                detail_texts.append(key_points[chapter_index - 1])
+            if not detail_texts:
+                detail_texts = [chapter_title]
+            for detail_index, detail in enumerate(detail_texts[:6], start=1):
+                leaf_label = _truncate_text(detail, 42)
+                leaf_id = self._normalize_mindmap_node_id(
+                    f"{theme_id}-leaf-{detail_index}", leaf_label, "leaf", used_ids
+                )
+                theme.children.append(
+                    MindMapNode(
+                        id=leaf_id,
+                        label=leaf_label,
+                        type="leaf",
+                        summary=_truncate_text(detail, 360),
+                        children=[],
+                        time_anchor=chapter_start,
+                        source_chapter_titles=[chapter_title],
+                        source_chapter_starts=[chapter_start],
+                    )
+                )
+            root.children.append(theme)
+        return root
 
     def _normalize_mindmap_node(
         self,
@@ -4879,10 +5476,9 @@ P 数索引：
         for item in (payload.get("source_chapter_starts") or []):
             if item is None or str(item).strip() == "":
                 continue
-            try:
-                source_starts.append(float(item))
-            except (TypeError, ValueError):
-                continue
+            parsed_start = _safe_float(item, default=-1.0)
+            if parsed_start >= 0:
+                source_starts.append(parsed_start)
 
         if not source_titles and not source_starts:
             inferred_titles, inferred_starts = self._infer_mindmap_sources(label, summary, chapters)
@@ -4899,7 +5495,9 @@ P 数索引：
             source_starts = source_starts[:pair_count]
 
         raw_time_anchor = payload.get("time_anchor")
-        time_anchor = float(raw_time_anchor) if raw_time_anchor is not None and str(raw_time_anchor).strip() != "" else None
+        time_anchor = _safe_float(raw_time_anchor, default=-1.0) if raw_time_anchor is not None else None
+        if time_anchor is not None and time_anchor < 0:
+            time_anchor = None
         if time_anchor is None and source_starts:
             time_anchor = min(source_starts)
         if time_anchor is None and normalized_children:
@@ -4978,10 +5576,10 @@ P 数索引：
             if query and haystack:
                 score += len(set(query[:24]) & set(haystack[:24]))
             ranked.append((score, chapter))
-        ranked.sort(key=lambda item: (-item[0], float(item[1].get("start") or 0)))
+        ranked.sort(key=lambda item: (-item[0], _safe_float(item[1].get("start"))))
         selected = [item[1] for item in ranked[:3] if item[0] > 0] or [ranked[0][1]]
         titles = [str(item.get("title") or "").strip() for item in selected if str(item.get("title") or "").strip()]
-        starts = [float(item.get("start") or 0) for item in selected]
+        starts = [_safe_float(item.get("start")) for item in selected]
         return titles[:3], starts[:3]
 
     def _build_summary_chunks(self, segments: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -5042,12 +5640,38 @@ P 数索引：
             start = max(cursor - overlap, start + 1)
         return chunks
 
+    def _build_summary_coverage_index(self, partial_summaries: list[dict[str, object]]) -> str:
+        """Produce one compact evidence line for every transcript chunk."""
+        lines: list[str] = []
+        for item in sorted(partial_summaries, key=lambda value: int(value.get("chunk_index") or 0)):
+            index = int(item.get("chunk_index") or 0)
+            start = _safe_float(item.get("chunk_start"))
+            end = _safe_float(item.get("chunk_end"), start)
+            overview = _truncate_text(str(item.get("overview") or "").strip(), 180)
+            points = [
+                _truncate_text(str(point).strip(), 110)
+                for point in item.get("bulletPoints") or []
+                if str(point).strip()
+            ][:3]
+            chapter_titles = [
+                _truncate_text(str(chapter.get("title") or "").strip(), 80)
+                for chapter in item.get("chapters") or []
+                if isinstance(chapter, dict) and str(chapter.get("title") or "").strip()
+            ][:4]
+            details = _truncate_text("；".join([part for part in [overview, *points, *chapter_titles] if part]), 180)
+            lines.append(f"分块{index} [{self._format_seconds(start)}-{self._format_seconds(end)}]：{details}")
+        return "\n".join(lines)
+
     def _build_aggregate_summary_inputs(
         self,
         partial_summaries: list[dict[str, object]],
         merged_chapters: list[dict[str, object]] | None = None,
     ) -> tuple[str, str]:
-        lines: list[str] = []
+        lines: list[str] = [
+            "## 全部内容块覆盖索引",
+            self._build_summary_coverage_index(partial_summaries),
+            "",
+        ]
         segments: list[dict[str, object]] = []
         final_chapters = merged_chapters or []
 
@@ -5087,7 +5711,7 @@ P 数索引：
                 if summary:
                     lines.append(f"[{self._format_seconds(start)}] {chapter_title}：{summary}")
             lines.append("")
-        return _truncate_text("\n".join(lines).strip(), 5200), _truncate_text(json.dumps(segments, ensure_ascii=False), 2600)
+        return _truncate_text("\n".join(lines).strip(), 7600), _truncate_text(json.dumps(segments, ensure_ascii=False), 3600)
 
     def _format_seconds(self, value: float) -> str:
         total = max(0, int(value))
@@ -5098,10 +5722,13 @@ P 数索引：
     def _build_transcript_excerpt(self, transcript: str) -> str:
         lines = [line.strip() for line in transcript.splitlines() if line.strip()]
         if len(lines) <= 120:
-            return _truncate_text("\n".join(lines), 3600)
-        head = lines[:70]
-        tail = lines[-35:]
-        return _truncate_text("\n".join(head + ["[...中间转写已省略...]"] + tail), 3600)
+            return _truncate_text("\n".join(lines), 4200)
+        # Uniform sampling preserves the middle of a long video instead of
+        # silently giving the LLM only the opening and closing sections.
+        sample_count = 48
+        indices = sorted({round(index * (len(lines) - 1) / (sample_count - 1)) for index in range(sample_count)})
+        sampled = [lines[index] for index in indices]
+        return _truncate_text("\n".join(sampled), 4200)
 
     def _build_aggregate_series_excerpt(self, transcript: str) -> str:
         blocks = [block.strip() for block in re.split(r"\n(?=##\s*P\d+\s)", transcript) if block.strip()]
@@ -5225,24 +5852,22 @@ P 数索引：
         return _truncate_text(json.dumps(compact_segments, ensure_ascii=False), total_limit)
 
     def _build_segments_excerpt(self, segments: list[dict[str, object]]) -> str:
-        if len(segments) <= 32:
+        if len(segments) <= 48:
             selected = segments
         else:
-            head = segments[:12]
-            middle_start = max(12, len(segments) // 2 - 4)
-            middle = segments[middle_start : middle_start + 8]
-            tail = segments[-12:]
-            selected = [*head, {"start": "...", "text": "中间分段已省略"}, *middle, *tail]
+            sample_count = 48
+            indices = sorted({round(index * (len(segments) - 1) / (sample_count - 1)) for index in range(sample_count)})
+            selected = [segments[index] for index in indices]
 
         compact_segments: list[dict[str, object]] = []
         for item in selected:
             compact_segments.append(
                 {
                     "start": item.get("start"),
-                    "text": _truncate_text(str(item.get("text") or ""), 72),
+                    "text": _truncate_text(str(item.get("text") or ""), 96),
                 }
             )
-        return _truncate_text(json.dumps(compact_segments, ensure_ascii=False), 1800)
+        return _truncate_text(json.dumps(compact_segments, ensure_ascii=False), 4200)
 
     def _summarize_with_rules(
         self,

@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -31,6 +32,43 @@ KNOWLEDGE_LLM_FIRST_CONTENT_TIMEOUT_SECONDS = 18.0
 class KnowledgeLlmStreamEvent:
     kind: str
     delta: str
+
+
+def _extract_json_from_reasoning(body: object) -> str:
+    if not isinstance(body, dict):
+        return ""
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    decoder = json.JSONDecoder()
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        for offset, character in enumerate(value):
+            if character != "{":
+                continue
+            try:
+                parsed, end = decoder.raw_decode(value[offset:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return value[offset : offset + end]
+    return ""
+
+
+def _is_ollama_base_url(base_url: str) -> bool:
+    parsed = urlparse(str(base_url or "").strip())
+    return parsed.hostname in {"127.0.0.1", "localhost", "::1"} and parsed.port == 11434
+
+
+def _ollama_native_chat_url(base_url: str) -> str:
+    parsed = urlparse(str(base_url or "").strip())
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{parsed.netloc}/api/chat"
 
 
 def resolve_knowledge_llm_settings(settings: ServiceSettings) -> tuple[bool, str, str, str, str]:
@@ -94,10 +132,27 @@ def chat_knowledge_llm(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if require_json:
-        payload["response_format"] = {"type": "json_object"}
-    request_url = anthropic_messages_url(base_url) if use_anthropic else openai_chat_completions_url(base_url)
-    request_payload = build_anthropic_messages_payload(payload) if use_anthropic else payload
+    use_ollama_native = require_json and not use_anthropic and _is_ollama_base_url(base_url)
+    if use_ollama_native:
+        request_url = _ollama_native_chat_url(base_url)
+        request_payload = {
+            "model": request_model,
+            "messages": payload["messages"],
+            "stream": False,
+            "think": False,
+            "format": "json",
+            "options": {
+                "temperature": temperature,
+                "num_predict": max(max_tokens, 256),
+            },
+        }
+    else:
+        if require_json:
+            payload["response_format"] = {"type": "json_object"}
+            payload["enable_thinking"] = False
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        request_url = anthropic_messages_url(base_url) if use_anthropic else openai_chat_completions_url(base_url)
+        request_payload = build_anthropic_messages_payload(payload) if use_anthropic else payload
 
     started_at = time.monotonic()
     logger.info("knowledge llm request start mode=chat base_url=%s model=%s max_tokens=%s", base_url, model, max_tokens)
@@ -134,6 +189,8 @@ def chat_knowledge_llm(
         body = None
 
     content = extract_llm_message_content(body)
+    if not content and require_json:
+        content = _extract_json_from_reasoning(body)
     if not content:
         raise HTTPException(status_code=502, detail="知识库 LLM 没有返回可读取内容。")
     return content, body if isinstance(body, dict) else None

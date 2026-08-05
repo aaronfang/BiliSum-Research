@@ -114,6 +114,12 @@ def extract_llm_message_content(body: object) -> str:
     if top_level_content:
         return top_level_content
 
+    top_level_message = body.get("message")
+    if isinstance(top_level_message, dict):
+        message_content = extract_text_from_content_blocks(top_level_message.get("content"))
+        if message_content:
+            return message_content
+
     for key in ("output_text", "response", "text"):
         value = body.get(key)
         if isinstance(value, str) and value.strip():

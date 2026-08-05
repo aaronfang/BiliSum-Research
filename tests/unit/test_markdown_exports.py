@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from video_sum_core.markdown_exports import build_export_filename, build_task_markdown_export
+from video_sum_core.markdown_exports import build_export_filename, build_mermaid_mindmap, build_task_markdown_export
 
 
 def test_build_task_markdown_export_for_obsidian_includes_frontmatter_and_sections() -> None:
@@ -90,3 +90,34 @@ def test_build_export_filename_sanitizes_invalid_characters() -> None:
     assert file_name.endswith("2026-04-22.md")
     assert "/" not in file_name
     assert ":" not in file_name
+
+
+def test_build_mermaid_mindmap_renders_nested_nodes() -> None:
+    mermaid = build_mermaid_mindmap(
+        {
+            "title": "函数专题",
+            "root": "root",
+            "nodes": [
+                {
+                    "id": "root",
+                    "label": "函数专题",
+                    "type": "root",
+                    "children": [
+                        {
+                            "id": "theme-1",
+                            "label": "定义与性质",
+                            "type": "theme",
+                            "children": [
+                                {"id": "leaf-1", "label": "定义域和值域", "type": "leaf", "children": []}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert mermaid.startswith("```mermaid\nmindmap\n")
+    assert "root((函数专题))" in mermaid
+    assert "    定义与性质" in mermaid
+    assert "      定义域和值域" in mermaid

@@ -83,6 +83,8 @@ export function App() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [startupAnnouncement, setStartupAnnouncement] = useState<StartupAnnouncement | null>(null);
   const [setupAssistantOpen, setSetupAssistantOpen] = useState(false);
+  const [autoSetupBusy, setAutoSetupBusy] = useState(false);
+  const [autoSetupStatus, setAutoSetupStatus] = useState("");
   const [cookieHelpDialogOpen, setCookieHelpDialogOpen] = useState(false);
   const [setupAssistantDismissed, setSetupAssistantDismissed] = useState(false);
   const setupAssistantForceRef = useRef(false);
@@ -461,6 +463,36 @@ export function App() {
     navigate("/settings");
   }
 
+  async function runAutoSetup() {
+    if (autoSetupBusy) {
+      return;
+    }
+    setAutoSetupBusy(true);
+    setAutoSetupStatus("正在检测硬件并安装本地运行环境，首次执行可能需要较长时间...");
+    try {
+      const response = await api.autoSetup({
+        cuda_variant: snapshot.settings?.cuda_variant || undefined,
+      });
+      setSnapshot((current) => ({
+        ...current,
+        settings: response.settings,
+        environment: response.environment,
+        systemInfo: current.systemInfo
+          ? { ...current.systemInfo, settings: response.settings, environment: response.environment }
+          : current.systemInfo,
+      }));
+      setRefreshSeed((value) => value + 1);
+      const failedSteps = response.steps
+        .filter((step) => step.status === "failed")
+        .map((step) => `${step.label}：${step.detail || "未提供错误详情"}`);
+      setAutoSetupStatus(failedSteps.length > 0 ? `${response.message} ${failedSteps.join("；")}` : response.message);
+    } catch (error) {
+      setAutoSetupStatus(error instanceof Error ? error.message : "自动安装失败，请前往设置查看详细状态。");
+    } finally {
+      setAutoSetupBusy(false);
+    }
+  }
+
   function navigateToPromptPreset(presetId: string) {
     setupAssistantForceRef.current = false;
     setSetupAssistantOpen(false);
@@ -590,7 +622,10 @@ export function App() {
   }
 
   function isBilibiliCookieHelpError(message: string) {
-    return /HTTP\s*412|cookies?\.txt|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
+    if (/YouTube|youtube\.com|youtu\.be/i.test(message)) {
+      return false;
+    }
+    return /HTTP\s*412|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
   }
 
   function showBilibiliCookieHelp(message: string) {
@@ -1217,6 +1252,9 @@ export function App() {
         onClose={closeSetupAssistant}
         onOpenSettings={openSettingsFromAssistant}
         onNavigateToIssue={navigateToConfigIssue}
+        onAutoSetup={() => void runAutoSetup()}
+        autoSetupBusy={autoSetupBusy}
+        autoSetupStatus={autoSetupStatus}
       />
       <CookieHelpDialog
         isOpen={cookieHelpDialogOpen}

@@ -45,6 +45,9 @@ run("calls markdown and transcript export APIs", async () => {
     if (rawUrl.endsWith("/videos/video-1/move") || rawUrl.endsWith("/videos/video-1/pin")) {
       return new Response(JSON.stringify({ video_id: "video-1", canonical_id: "video-1", platform: "bilibili", title: "Video", source_url: "", cover_url: "", has_result: false, is_favorite: false, global_order: 0, folder_order: 0, global_pinned: false, folder_pinned: false, pages: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }), { status: 200 });
     }
+    if (rawUrl.endsWith("/exports/markdown/preview")) {
+      return new Response(JSON.stringify({ task_id: "task-1", items: [{ tag: "AI", source: "manual", selected: true }] }), { status: 200 });
+    }
     const isTranscript = String(url).includes("/exports/transcript");
     return new Response(JSON.stringify({
       task_id: "task-1",
@@ -65,6 +68,7 @@ run("calls markdown and transcript export APIs", async () => {
     target: "obsidian",
     include_transcript: true,
     output_dir: "C:/picked",
+    tags: ["AI", "视频创作"],
   });
 
   assert.equal(response.target_format, "obsidian");
@@ -74,6 +78,7 @@ run("calls markdown and transcript export APIs", async () => {
   assert.equal(markdownBody.target, "obsidian");
   assert.equal(markdownBody.include_transcript, true);
   assert.equal(markdownBody.output_dir, "C:/picked");
+  assert.deepEqual(markdownBody.tags, ["AI", "视频创作"]);
 
   const transcriptResponse = await api.exportTaskTranscript("task-1", { output_dir: "C:/picked" });
 
@@ -111,6 +116,10 @@ run("calls markdown and transcript export APIs", async () => {
   assert.deepEqual(JSON.parse(String(requests[9]?.options?.body)), { video_ids: ["video-1"], folder_id: "__global__" });
   assert.equal(requests[10]?.url, "/api/v1/videos/video-1/move");
   assert.equal(requests[11]?.url, "/api/v1/videos/video-1/pin");
+
+  const tagPreview = await api.getTaskMarkdownTagPreview("task-1");
+  assert.deepEqual(tagPreview.items, [{ tag: "AI", source: "manual", selected: true }]);
+  assert.equal(requests[12]?.url, "/api/v1/tasks/task-1/exports/markdown/preview");
 
   globalThis.fetch = originalFetch;
   globalThis.window = originalWindow;

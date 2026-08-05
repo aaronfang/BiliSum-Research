@@ -291,6 +291,17 @@ run("translates common llm 404 errors into friendly chinese", () => {
   assert.match(message, /Base URL/);
 });
 
+run("distinguishes YouTube HTTP 403 from model permission errors", () => {
+  const youtube = describeUserFacingErrorMessage(
+    "Failed to read or download video with yt-dlp: ERROR: unable to download video data: HTTP Error 403: Forbidden",
+  );
+  assert.match(youtube, /YouTube/);
+  assert.match(youtube, /Cookies/);
+
+  const model = describeUserFacingErrorMessage("LLM request failed with status 403: Forbidden");
+  assert.match(model, /没有访问这个模型/);
+});
+
 run("uses translated error detail in failed workspace state", () => {
   const state = describeTaskContentState(
     createTaskDetail({

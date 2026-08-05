@@ -30,6 +30,186 @@ def _build_runner() -> RealPipelineRunner:
     )
 
 
+def test_mindmap_normalization_accepts_list_wrapped_timestamps(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+    result = TaskResult(
+        overview="Overview",
+        timeline=[{"title": "Chapter", "start": [12.5], "summary": "Chapter summary"}],
+    )
+
+    mindmap = runner._normalize_mindmap_payload(
+        {
+            "title": "Map",
+            "root": "root",
+            "nodes": [
+                {
+                    "id": "root",
+                    "label": "Root",
+                    "type": "root",
+                    "summary": "Root summary",
+                    "children": [
+                        {
+                            "id": "theme",
+                            "label": "Theme",
+                            "type": "theme",
+                            "summary": "Theme summary",
+                            "children": [
+                                {
+                                    "id": "leaf",
+                                    "label": "Leaf",
+                                    "type": "leaf",
+                                    "summary": "Leaf summary",
+                                    "children": [],
+                                    "time_anchor": [12.5],
+                                    "source_chapter_titles": ["Chapter"],
+                                    "source_chapter_starts": [[12.5]],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+        title="Map",
+        result=result,
+    )
+
+    leaf = mindmap.nodes[0].children[0].children[0]
+    assert leaf.time_anchor == 12.5
+    assert leaf.source_chapter_starts == [12.5]
+
+
+def test_mindmap_sparse_llm_payload_is_expanded_from_chapters(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+    result = TaskResult(
+        overview="视频介绍工具配置、几何节点实验和角色动画重定向。",
+        key_points=[
+            "官方 MCP 插件需要安装并启动服务器。",
+            "几何节点支持气泡参数调节。",
+            "角色骨骼差异会影响动画重定向。",
+        ],
+        timeline=[
+            {"title": "插件配置", "start": 0, "summary": "安装官方 MCP 插件并确认服务器自动启动。"},
+            {"title": "几何节点实验", "start": 120, "summary": "通过几何节点生成气泡并调整尺寸、频率和扩散速度。"},
+            {"title": "角色重定向", "start": 240, "summary": "不同骨骼数量和休息姿态导致手臂重定向仍需修正。"},
+        ],
+    )
+
+    mindmap = runner._normalize_mindmap_payload(
+        {"title": "稀疏导图", "root": "root", "nodes": [{"id": "root", "label": "", "type": "root", "children": []}]},
+        title="视频主题",
+        result=result,
+    )
+
+    assert len(mindmap.nodes[0].children) == 3
+    leaves = []
+
+    def collect(node):
+        if node.type == "leaf":
+            leaves.append(node)
+        for child in node.children:
+            collect(child)
+
+    collect(mindmap.nodes[0])
+    assert len(leaves) >= 6
+    assert all(leaf.time_anchor is not None for leaf in leaves)
+    assert all(leaf.source_chapter_starts for leaf in leaves)
+
+
+def test_visual_download_uses_youtube_cookies_and_ejs_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import video_sum_core.pipeline.real as real_module
+
+    cookiefile = tmp_path / "youtube.txt"
+    cookiefile.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path / "tasks",
+            runtime_channel="base",
+            ytdlp_youtube_cookies_file=str(cookiefile),
+            visual_download_resolution="720p",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def download(self, urls):
+            output_template = str(captured["outtmpl"])
+            Path(output_template.replace("%(ext)s", "mp4")).write_bytes(b"video")
+
+    monkeypatch.setattr(real_module, "_get_ytdlp_classes", lambda: (FakeYoutubeDL, DownloadError))
+    monkeypatch.setattr(real_module, "ffmpeg_location", lambda: None)
+    monkeypatch.setattr(real_module.shutil, "which", lambda name: r"C:\Program Files\nodejs\node.exe" if name == "node" else None)
+
+    source = runner._download_video_for_visuals(
+        "https://www.youtube.com/watch?v=test-video",
+        tmp_path / "visual",
+        "test-video",
+    )
+
+    assert source.exists()
+    assert captured["cookiefile"] == str(cookiefile)
+    assert captured["remote_components"] == ["ejs:github"]
+    assert captured["js_runtimes"] == {"node": {"path": r"C:\Program Files\nodejs\node.exe"}}
+
+
+def test_local_ollama_uses_small_chunk_model_and_resumes_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import video_sum_core.pipeline.real as real_module
+
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_model="qwen3:14b",
+            llm_base_url="http://127.0.0.1:11434/v1",
+        )
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "qwen3:14b"}, {"name": "qwen3:8b"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            assert url == "http://127.0.0.1:11434/api/tags"
+            return FakeResponse()
+
+    monkeypatch.setattr(real_module.httpx, "Client", FakeClient)
+    assert runner._resolve_summary_chunk_model("http://127.0.0.1:11434/v1") == "qwen3:8b"
+
+    chunks = [{"index": 1, "transcript": "hello", "segments_json": "[]"}]
+    cache_path = tmp_path / "summary_chunks.json"
+    summary = {"chunk_index": 1, "overview": "cached"}
+    runner._save_summary_chunk_cache(cache_path, model_name="qwen3:8b", chunks=chunks, cached={1: summary})
+    assert runner._load_summary_chunk_cache(cache_path, model_name="qwen3:8b", chunks=chunks) == {1: summary}
+    assert runner._build_llm_summary_payload("t", "x", "[]", model_name="qwen3:8b")["model"] == "qwen3:8b"
+
+
 def test_summarize_falls_back_to_rules_when_llm_auth_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _build_runner()
     transcript = "[00:00] 第一条\n[00:10] 第二条\n[00:20] 第三条"
@@ -675,6 +855,97 @@ def test_probe_video_uses_cookies_file_and_browser_headers(monkeypatch: pytest.M
     assert captured_options["http_headers"]["Referer"] == "https://www.bilibili.com/"
 
 
+def test_probe_video_uses_configured_cookie_browser(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured_options: dict[str, object] = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            captured_options.update(options)
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+            return {"title": "YouTube 测试视频"}
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(
+        "video_sum_core.pipeline.real.shutil.which",
+        lambda name: None if name == "deno" else "C:/Program Files/nodejs/node.exe",
+    )
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, ytdlp_cookies_browser="edge"))
+
+    assert runner._probe_video("https://www.youtube.com/watch?v=Xdy1vkhSz-M")["title"] == "YouTube 测试视频"
+    assert captured_options["cookiesfrombrowser"] == ("edge",)
+    assert "cookiefile" not in captured_options
+    assert captured_options["js_runtimes"] == {"node": {"path": "C:/Program Files/nodejs/node.exe"}}
+
+
+def test_probe_video_uses_platform_specific_cookies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured_options: dict[str, object] = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            captured_options.update(options)
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+            return {"title": "测试视频"}
+
+    bilibili_file = tmp_path / "bilibili.txt"
+    youtube_file = tmp_path / "youtube.txt"
+    bilibili_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    youtube_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    monkeypatch.setattr("video_sum_core.pipeline.real.YoutubeDL", FakeYoutubeDL)
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            ytdlp_cookies_file=str(bilibili_file),
+            ytdlp_youtube_cookies_file=str(youtube_file),
+        )
+    )
+
+    runner._probe_video("https://www.bilibili.com/video/BV1xx411c7mD")
+    assert captured_options["cookiefile"] == str(bilibili_file)
+
+    runner._probe_video("https://www.youtube.com/watch?v=Xdy1vkhSz-M")
+    assert captured_options["cookiefile"] == str(youtube_file)
+
+
+def test_probe_video_maps_youtube_bot_error_to_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            pass
+
+        def __enter__(self) -> "FakeYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+            raise DownloadError(
+                "ERROR: [youtube] Xdy1vkhSz-M: Sign in to confirm you're not a bot."
+            )
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.YoutubeDL", FakeYoutubeDL)
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path))
+
+    with pytest.raises(VideoSumError, match="YouTube.*Cookies 文件"):
+        runner._probe_video("https://www.youtube.com/watch?v=Xdy1vkhSz-M")
+
+
 def test_probe_video_maps_bilibili_412_to_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -719,7 +990,7 @@ def test_probe_video_maps_chrome_cookie_database_failure_to_actionable_error(
     monkeypatch.setattr("video_sum_core.pipeline.real.YoutubeDL", FakeYoutubeDL)
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, ytdlp_cookies_browser="chrome"))
 
-    with pytest.raises(VideoSumError, match="登录窗口"):
+    with pytest.raises(VideoSumError, match="B 站 Cookies 文件"):
         runner._probe_video("https://www.bilibili.com/video/BV1xx411c7mD")
 
 
@@ -743,7 +1014,7 @@ def test_probe_video_maps_browser_dpapi_failure_to_actionable_error(
     monkeypatch.setattr("video_sum_core.pipeline.real.YoutubeDL", FakeYoutubeDL)
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, ytdlp_cookies_browser="chrome"))
 
-    with pytest.raises(VideoSumError, match="登录窗口"):
+    with pytest.raises(VideoSumError, match="B 站 Cookies 文件"):
         runner._probe_video("https://www.bilibili.com/video/BV1xx411c7mD")
 
 
@@ -1079,6 +1350,43 @@ def test_visual_frame_insert_mode_composes_note_without_vlm(tmp_path: Path, monk
     assert "> 结合截图理解主题。" in markdown
     assert "## 图文笔记素材" not in markdown
     assert not describe_called
+
+
+def test_visual_local_fallback_keeps_insertions_when_anchors_do_not_match_note_headings(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, visual_note_mode="frame_insert"))
+    note = runner._compose_visual_enhanced_note(
+        title="EasyMedia",
+        result=TaskResult(
+            knowledge_note_markdown="# EasyMedia\n\n## 工具概述\n\n正文说明。\n\n## AI字幕生成系统\n\n字幕说明。"
+        ),
+        observations=[],
+        insert_plan={
+            "insertions": [
+                {
+                    "frame_id": "f0001",
+                    "markdown_image": "visual://f0001",
+                    "anchor_heading": "多轨编辑器功能",
+                    "caption": "核心节点",
+                    "alt": "00:23 核心节点",
+                    "explanation": "展示核心节点。",
+                },
+                {
+                    "frame_id": "f0002",
+                    "markdown_image": "visual://f0002",
+                    "anchor_heading": "界面设计特点",
+                    "caption": "界面设计",
+                    "alt": "04:05 界面设计",
+                    "explanation": "展示界面设计。",
+                },
+            ]
+        },
+        mode="frame_insert",
+    )
+
+    assert note.count("visual://") == 2
+    assert "## 图文笔记素材" in note
+    assert "![00:23 核心节点](visual://f0001)" in note
+    assert "![04:05 界面设计](visual://f0002)" in note
 
 
 def test_visual_evidence_force_rebuild_clears_previous_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

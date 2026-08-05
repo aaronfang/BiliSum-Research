@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
-
 from video_sum_core.markdown_exports import build_export_filename
 from video_sum_core.models.tasks import InputType, TaskInput, TaskResult, TaskStatus
 from video_sum_infra.config import ServiceSettings
@@ -12,7 +11,12 @@ from video_sum_service import task_exports
 from video_sum_service.app import app, settings_manager
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.schemas import VideoAssetRecord
-from video_sum_service.task_exports import export_task_markdown, export_task_transcript
+from video_sum_service.task_exports import (
+    _build_export_tags,
+    export_task_markdown,
+    export_task_transcript,
+    export_tasks_markdown,
+)
 
 
 def create_repository() -> SqliteTaskRepository:
@@ -104,27 +108,195 @@ def test_export_task_markdown_writes_file_and_persists_artifact(tmp_path: Path) 
     assert "## 转写全文" not in content
 
 
-def test_export_task_markdown_can_include_transcript_and_override_output_dir(tmp_path: Path) -> None:
+def test_export_tags_keep_persisted_tags_without_extracting_summary_terms() -> None:
+    repository = create_repository()
+    result = TaskResult(
+        overview="介绍节点式视频创作工具，重点比较多轨编辑、字幕烧录和视频对比流程。",
+        key_points=[
+            "通过路径合并、字幕烧录和视频对比完成多轨编辑。",
+            "安装 Blender 轻量版并激活官方 MCP 插件。",
+        ],
+        knowledge_note_markdown="# EasyMedia 节点包基础介绍\n\n正文包含 #视频创作 和 #Blender-插件",
+    )
+    video = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="BV-tag-preview",
+            platform="bilibili",
+            title="测试视频",
+            source_url="https://www.bilibili.com/video/BV-tag-preview",
+        )
+    )
+    repository.add_video_tag(video.video_id, "  MCP 插件  ", source="manual")
+    repository.add_video_tag(video.video_id, "自动候选", source="auto_llm")
+
+    tags = _build_export_tags(
+        repository,
+        video.video_id,
+        title="EasyMedia 节点包基础介绍：支持 Flux3、Bernini 的多轨导演台编辑器",
+        result=result,
+        note_markdown=result.knowledge_note_markdown,
+    )
+
+    assert tags == ["MCP-插件", "视频创作", "Blender-插件", "自动候选"]
+    assert "EasyMedia" not in tags
+    assert "Flux3" not in tags
+    assert "字幕烧录" not in tags
+
+
+def test_export_tag_preview_selects_auto_tags_by_default() -> None:
     repository = create_repository()
     task_id = create_completed_task(repository)
+    record = repository.get_task(task_id)
+    assert record is not None and record.video_id is not None
+    repository.add_video_tag(record.video_id, "MCP", source="manual")
+    repository.add_video_tag(record.video_id, "大模型", source="auto_llm")
+
+    items = task_exports.build_export_tag_preview(repository, task_id)
+
+    assert [(item["tag"], item["source"], item["selected"]) for item in items] == [
+        ("MCP", "manual", True),
+        ("大模型", "auto_llm", True),
+    ]
+
+
+def test_export_task_markdown_includes_manual_tags_without_summary_terms(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    record = repository.get_task(task_id)
+    assert record is not None and record.video_id is not None
+    repository.add_video_tag(record.video_id, "MCP 插件", source="manual")
+    repository.add_video_tag(record.video_id, "note/source", source="system")
+    repository.add_video_tag(record.video_id, "has/transcript", source="system")
     app.state.task_repository = repository
     settings = ServiceSettings(
         data_dir=tmp_path / "data",
         cache_dir=tmp_path / "cache",
         tasks_dir=tmp_path / "tasks",
-        output_dir=str(tmp_path / "default-vault"),
+        output_dir=str(tmp_path / "vault"),
+    )
+
+    response = export_task_markdown(repository, settings, task_id)
+    content = Path(response.path).read_text(encoding="utf-8")
+
+    assert '  - "MCP-插件"' in content
+    assert '  - "测试导出视频"' not in content
+    assert '  - "source/bilibili"' not in content
+    assert '  - "note/source"' not in content
+    assert '  - "has/transcript"' not in content
+
+
+def test_export_task_markdown_uses_explicit_tag_override(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    record = repository.get_task(task_id)
+    assert record is not None and record.video_id is not None
+    repository.add_video_tag(record.video_id, "数据库标签", source="manual")
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(tmp_path / "vault"),
+    )
+
+    response = export_task_markdown(repository, settings, task_id, tags=["#导出标签"])
+    content = Path(response.path).read_text(encoding="utf-8")
+
+    assert '  - "导出标签"' in content
+    assert '  - "数据库标签"' not in content
+
+
+def test_batch_export_includes_auto_tags_by_default(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    record = repository.get_task(task_id)
+    assert record is not None and record.video_id is not None
+    repository.add_video_tag(record.video_id, "自动主题", source="auto_llm")
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(tmp_path / "vault"),
+    )
+
+    response = export_tasks_markdown(repository, settings, [task_id])
+    content = Path(response.exported[0].path).read_text(encoding="utf-8")
+
+    assert '  - "自动主题"' in content
+
+
+def test_export_tasks_markdown_exports_completed_and_reports_failures(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(tmp_path / "vault"),
+    )
+
+    response = export_tasks_markdown(repository, settings, [task_id, "missing-task"])
+
+    assert response.requested_count == 2
+    assert [item.task_id for item in response.exported] == [task_id]
+    assert [(item.task_id, item.error) for item in response.failed] == [("missing-task", "Task not found.")]
+
+
+def test_export_task_markdown_renders_mindmap_and_copies_json(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    record = repository.get_task(task_id)
+    assert record is not None and record.result is not None
+    mindmap_path = tmp_path / "tasks" / task_id / "mindmap.json"
+    mindmap_path.parent.mkdir(parents=True, exist_ok=True)
+    mindmap_path.write_text(
+        '{"version":1,"title":"导图","root":"root","nodes":[{"id":"root","label":"导图","type":"root","children":[{"id":"theme","label":"主题","type":"theme","children":[]}]}]}',
+        encoding="utf-8",
+    )
+    repository.save_result(
+        task_id,
+        record.result.model_copy(
+            update={
+                "mindmap_status": "ready",
+                "mindmap_artifact_path": str(mindmap_path),
+                "artifacts": {**record.result.artifacts, "mindmap_path": str(mindmap_path)},
+            }
+        ),
+    )
+    app.state.task_repository = repository
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(tmp_path / "vault"),
+    )
+
+    response = export_task_markdown(repository, settings, task_id)
+    export_path = Path(response.path)
+    content = export_path.read_text(encoding="utf-8")
+
+    assert "## 思维导图" in content
+    assert "```mermaid\nmindmap" in content
+    assert "root((导图))" in content
+    assert (export_path.parent / f"{export_path.stem}.assets" / "mindmap.json").exists()
+    assert str(mindmap_path) not in content
+
+
+def test_export_task_markdown_can_include_transcript_from_configured_output_dir(tmp_path: Path) -> None:
+    repository = create_repository()
+    task_id = create_completed_task(repository)
+    app.state.task_repository = repository
+    output_dir = tmp_path / "picked-vault"
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(output_dir),
     )
     settings_manager._settings = settings
 
-    response = export_task_markdown(
-        repository,
-        settings,
-        task_id,
-        include_transcript=True,
-        output_dir=str(tmp_path / "picked-vault"),
-    )
+    response = export_task_markdown(repository, settings, task_id, include_transcript=True)
 
-    assert Path(response.path).parent == tmp_path / "picked-vault"
+    assert Path(response.path).parent == output_dir
     content = Path(response.path).read_text(encoding="utf-8")
     assert "## 转写全文" in content
     assert "[00:00] 转写内容" in content
@@ -168,7 +340,7 @@ def test_export_task_markdown_copies_visual_assets_with_relative_links(tmp_path:
     assert "这个概念需要对照画面理解。" in content
     assert "画面说明被整合进正文。" in content
     assert "## 视觉证据" not in content
-    assert f"]({export_path.stem}.assets/f0001.jpg)" in content
+    assert f"![[{export_path.stem}.assets/f0001.jpg]]" in content
     assert (export_path.parent / f"{export_path.stem}.assets" / "f0001.jpg").read_bytes() == b"fake-jpeg"
     assert "visual_evidence" not in content
 
@@ -211,7 +383,7 @@ def test_export_task_markdown_copies_visual_asset_by_frame_index(tmp_path: Path)
     export_path = Path(response.path)
     content = export_path.read_text(encoding="utf-8")
 
-    assert f"]({export_path.stem}.assets/frame-a.webp)" in content
+    assert f"![[{export_path.stem}.assets/frame-a.webp]]" in content
     assert (export_path.parent / f"{export_path.stem}.assets" / "frame-a.webp").read_bytes() == b"fake-webp"
 
 

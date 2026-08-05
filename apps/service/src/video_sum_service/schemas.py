@@ -36,6 +36,18 @@ class TaskMarkdownExportRequest(BaseModel):
     target: Literal["markdown", "obsidian"] = "obsidian"
     include_transcript: bool = False
     output_dir: str | None = None
+    tags: list[str] | None = None
+
+
+class TaskMarkdownTagPreviewItem(BaseModel):
+    tag: str
+    source: str
+    selected: bool = True
+
+
+class TaskMarkdownTagPreviewResponse(BaseModel):
+    task_id: str
+    items: list[TaskMarkdownTagPreviewItem] = Field(default_factory=list)
 
 
 class TaskTranscriptExportRequest(BaseModel):
@@ -301,6 +313,25 @@ class TaskMarkdownExportResponse(BaseModel):
     file_name: str
     overwritten: bool = False
     artifact_key: str
+
+
+class TaskMarkdownBatchExportRequest(BaseModel):
+    task_ids: list[str] = Field(default_factory=list)
+    target: Literal["markdown", "obsidian"] = "obsidian"
+    include_transcript: bool = False
+    output_dir: str | None = None
+
+
+class TaskMarkdownBatchExportFailure(BaseModel):
+    task_id: str
+    error: str
+
+
+class TaskMarkdownBatchExportResponse(BaseModel):
+    target_format: Literal["markdown", "obsidian"]
+    requested_count: int
+    exported: list[TaskMarkdownExportResponse] = Field(default_factory=list)
+    failed: list[TaskMarkdownBatchExportFailure] = Field(default_factory=list)
 
 
 class TaskEventResponse(BaseModel):
