@@ -172,7 +172,7 @@ def test_visual_download_uses_youtube_cookies_and_ejs_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import video_sum_core.pipeline.real as real_module
+    from video_sum_core.pipeline import real as real_module
 
     cookiefile = tmp_path / "youtube.txt"
     cookiefile.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
@@ -221,7 +221,7 @@ def test_audio_download_uses_youtube_cookies_and_platform_headers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import video_sum_core.pipeline.real as real_module
+    from video_sum_core.pipeline import real as real_module
 
     cookiefile = tmp_path / "youtube.txt"
     cookiefile.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
@@ -273,7 +273,7 @@ def test_local_ollama_uses_small_chunk_model_and_resumes_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import video_sum_core.pipeline.real as real_module
+    from video_sum_core.pipeline import real as real_module
 
     runner = RealPipelineRunner(
         PipelineSettings(
