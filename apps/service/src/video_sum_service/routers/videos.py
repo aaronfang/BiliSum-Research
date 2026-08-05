@@ -35,7 +35,10 @@ from video_sum_service.schemas import (
     VideoTaskBatchResponse,
     VideoTaskCreateRequest,
 )
-from video_sum_service.task_artifacts import cleanup_video_files, load_task_segments
+from video_sum_service.task_artifacts import (
+    cleanup_video_files,
+    load_reusable_transcript,
+)
 from video_sum_service.video_assets import (
     infer_local_input_type,
     is_supported_local_media_file,
@@ -332,13 +335,15 @@ def _create_resummary_task_record(
     summary_path = source_task.result.artifacts.get("summary_path") if source_task.result else None
     if not summary_path:
         raise HTTPException(status_code=400, detail="所选任务缺少可复用的分段文件。")
-    segments = load_task_segments(summary_path)
+    transcript, segments, transcript_source = load_reusable_transcript(source_task.result)
 
     payload = json.dumps(
         {
             "title": source_task.task_input.title or video.title,
-            "transcript": source_task.result.transcript_text,
+            "transcript": transcript,
             "segments": segments,
+            "media_source": video.source_url,
+            "transcript_source": transcript_source,
         },
         ensure_ascii=False,
     )

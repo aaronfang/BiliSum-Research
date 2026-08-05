@@ -20,7 +20,9 @@ import type {
   SystemInfo,
   TaskDetail,
   TaskEvent,
+  TaskMarkdownBatchExportResponse,
   TaskMarkdownExportResponse,
+  TaskMarkdownTagPreviewResponse,
   TaskMindMapResponse,
   TaskVisualEvidenceResponse,
   TaskSummary,
@@ -408,14 +410,24 @@ export const api = {
   getTaskVisualEvidence(taskId: string) {
     return fetchJson<TaskVisualEvidenceResponse>(`/api/v1/tasks/${taskId}/visual-evidence`);
   },
+  getTaskMarkdownTagPreview(taskId: string) {
+    return fetchJson<TaskMarkdownTagPreviewResponse>(`/api/v1/tasks/${taskId}/exports/markdown/preview`);
+  },
   exportTaskMarkdown(
     taskId: string,
-    payload?: { target?: "markdown" | "obsidian"; include_transcript?: boolean; output_dir?: string },
+    payload?: { target?: "markdown" | "obsidian"; include_transcript?: boolean; output_dir?: string; tags?: string[] },
   ) {
     return fetchJson<TaskMarkdownExportResponse>(`/api/v1/tasks/${taskId}/exports/markdown`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload ?? {}),
+    });
+  },
+  exportTasksMarkdown(payload: { task_ids: string[]; target?: "markdown" | "obsidian"; include_transcript?: boolean; output_dir?: string }) {
+    return fetchJson<TaskMarkdownBatchExportResponse>("/api/v1/tasks/exports/markdown/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     });
   },
   exportTaskTranscript(taskId: string, payload?: { output_dir?: string }) {
@@ -444,6 +456,28 @@ export const api = {
   },
   deleteTask(taskId: string) {
     return fetchJson<{ deleted: boolean }>(`/api/v1/tasks/${taskId}`, { method: "DELETE" });
+  },
+  autoSetup(payload?: {
+    cuda_variant?: string;
+    install_cuda?: boolean;
+    install_funasr?: boolean;
+    install_knowledge?: boolean;
+    download_embedding?: boolean;
+    download_funasr_models?: boolean;
+    configure_defaults?: boolean;
+  }) {
+    return fetchJson<{
+      ok: boolean;
+      message: string;
+      failedStep?: string | null;
+      steps: Array<{ id: string; label: string; status: string; detail?: string }>;
+      settings: ServiceSettings;
+      environment: EnvironmentInfo;
+    }>("/api/v1/setup/auto", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? {}),
+    });
   },
   installCuda(payload: { cuda_variant: string; installSessionId?: string }) {
     return fetchJson<{

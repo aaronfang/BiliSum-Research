@@ -63,6 +63,7 @@
 .update-dialog-footer {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 16px 24px;
   border-top: 1px solid var(--border-subtle);
@@ -330,6 +331,35 @@
 .setup-assistant-issue.tone-warning {
   border-color: var(--warning-border);
   background: color-mix(in srgb, var(--bg-card) 86%, var(--bg-warning) 14%);
+}
+
+.setup-assistant-status {
+  display: grid;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+}
+
+.setup-assistant-status.tone-warning {
+  border-color: var(--warning-border);
+  background: color-mix(in srgb, var(--bg-card) 86%, var(--bg-warning) 14%);
+}
+
+.setup-assistant-status.tone-info {
+  border-color: var(--border-focus);
+  background: color-mix(in srgb, var(--bg-card) 88%, var(--bg-accent) 12%);
+}
+
+.setup-assistant-status p,
+.setup-assistant-status strong {
+  margin: 0;
+}
+
+.setup-assistant-status p {
+  color: var(--text-secondary);
+  line-height: 1.55;
 }
 
 .setup-assistant-ok {
@@ -731,6 +761,225 @@
 .release-notes a:hover {
   color: var(--brand-700);
   text-decoration: underline;
+}
+
+.tag-export-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.46);
+  backdrop-filter: blur(7px);
+  animation: fadeIn 180ms ease;
+}
+
+.tag-export-dialog {
+  width: min(640px, 100%);
+  max-height: min(82vh, 760px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-2xl);
+  background: var(--bg-canvas);
+  box-shadow: var(--shadow-xl);
+  animation: slideUp 220ms ease;
+}
+
+.tag-export-dialog-header,
+.tag-export-dialog-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px;
+}
+
+.tag-export-dialog-header {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.tag-export-dialog-header h2,
+.tag-export-dialog-header p {
+  margin: 0;
+}
+
+.tag-export-dialog-header h2 {
+  font-size: 1.2rem;
+}
+
+.tag-export-dialog-header p {
+  max-width: 480px;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-export-dialog-kicker {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--brand-600);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.tag-export-dialog-close {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tag-export-dialog-close:hover {
+  background: var(--bg-danger);
+  color: var(--danger);
+}
+
+.tag-export-dialog-body {
+  display: grid;
+  gap: 18px;
+  overflow-y: auto;
+  padding: 22px 24px;
+}
+
+.tag-export-dialog-intro,
+.tag-export-dialog-section {
+  display: grid;
+  gap: 10px;
+}
+
+.tag-export-dialog-intro {
+  padding: 14px 16px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-accent);
+}
+
+.tag-export-dialog-intro span,
+.tag-export-dialog-status,
+.tag-export-dialog-error,
+.tag-export-dialog-section-head span,
+.tag-export-dialog-empty {
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.tag-export-dialog-error {
+  margin: 0;
+  color: var(--danger);
+}
+
+.tag-export-dialog-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tag-export-dialog-tags,
+.tag-export-dialog-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 34px;
+}
+
+.tag-export-dialog-tag,
+.tag-export-dialog-suggestion {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: var(--bg-subtle);
+  color: var(--text-primary);
+  font-size: 0.82rem;
+}
+
+.tag-export-dialog-tag {
+  padding: 4px 5px 4px 11px;
+}
+
+.tag-export-dialog-tag small,
+.tag-export-dialog-suggestion small {
+  color: var(--text-tertiary);
+  font-size: 0.7rem;
+}
+
+.tag-export-dialog-tag button {
+  width: 23px;
+  height: 23px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.tag-export-dialog-tag button:hover {
+  background: var(--bg-danger);
+  color: var(--danger);
+}
+
+.tag-export-dialog-suggestion {
+  padding: 6px 11px;
+  cursor: pointer;
+}
+
+.tag-export-dialog-suggestion:hover {
+  border-color: var(--accent-border);
+  background: var(--bg-accent);
+  color: var(--brand-700);
+}
+
+.tag-export-dialog-add-label {
+  color: var(--text-primary);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.tag-export-dialog-add-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.tag-export-dialog-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-secondary);
+  font-size: 0.86rem;
+  cursor: pointer;
+}
+
+.tag-export-dialog-checkbox input {
+  accent-color: var(--brand-500);
+}
+
+.tag-export-dialog-status,
+.tag-export-dialog-error {
+  margin: 0;
+}
+
+.tag-export-dialog-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
 }
 
 @keyframes fade-up {

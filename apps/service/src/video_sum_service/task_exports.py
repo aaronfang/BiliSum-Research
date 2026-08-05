@@ -1,20 +1,46 @@
 from __future__ import annotations
 
-from datetime import datetime
 import json
+import os
 import re
-from pathlib import Path
 import shutil
+from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 from fastapi import HTTPException
-
+from video_sum_core.markdown_exports import (
+    build_export_filename,
+    build_mermaid_mindmap,
+    build_task_markdown_export,
+)
 from video_sum_core.models.tasks import TaskStatus
-from video_sum_core.markdown_exports import build_export_filename, build_task_markdown_export
 from video_sum_infra.config import ServiceSettings
 
 from video_sum_service.repository import SqliteTaskRepository
-from video_sum_service.schemas import TaskMarkdownExportResponse
+from video_sum_service.schemas import (
+    TaskMarkdownBatchExportFailure,
+    TaskMarkdownBatchExportResponse,
+    TaskMarkdownExportResponse,
+)
+from video_sum_service.tag_utils import normalize_tag, tag_key
+
+
+def _resolve_export_directory(raw_path: str) -> Path:
+    expanded_path = os.path.expanduser(raw_path)
+    return Path(os.path.realpath(expanded_path))
+
+
+def _resolve_task_artifact_path(raw_path: str | None, tasks_dir: Path) -> Path | None:
+    if not raw_path:
+        return None
+    safe_root = tasks_dir.expanduser().resolve()
+    candidate = Path(raw_path).expanduser().resolve()
+    try:
+        candidate.relative_to(safe_root)
+    except ValueError:
+        return None
+    return candidate
 
 
 def export_task_markdown(
@@ -25,6 +51,8 @@ def export_task_markdown(
     target: Literal["markdown", "obsidian"] = "obsidian",
     include_transcript: bool = False,
     output_dir: str | None = None,
+    overwrite_existing: bool = False,
+    tags: list[str] | None = None,
 ) -> TaskMarkdownExportResponse:
     normalized_target = str(target or "obsidian").strip().lower()
     if normalized_target not in {"markdown", "obsidian"}:
@@ -40,11 +68,11 @@ def export_task_markdown(
     if not result.knowledge_note_markdown.strip():
         raise HTTPException(status_code=400, detail="当前任务缺少知识笔记，暂时无法导出 Markdown。")
 
-    output_dir_raw = str(output_dir or current_settings.output_dir or "").strip()
+    output_dir_raw = str(current_settings.output_dir or "").strip()
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先在设置中配置输出目录，再导出 Markdown / Obsidian 笔记。")
 
-    export_directory = Path(output_dir_raw).expanduser()
+    export_directory = _resolve_export_directory(output_dir_raw)
     export_directory.mkdir(parents=True, exist_ok=True)
 
     video = repository.get_video_asset(record.video_id) if record.video_id else None
@@ -56,8 +84,11 @@ def export_task_markdown(
     )
     preferred_file_name = build_export_filename(title, export_time)
     platform = str(video.platform if video else record.task_input.platform_hint or "").strip().lower() or "unknown"
-    tags = ["bilisum", platform, "video-summary"]
-    export_path, had_name_conflict = _choose_markdown_export_path(export_directory, preferred_file_name)
+    if overwrite_existing:
+        export_path = export_directory / preferred_file_name
+        had_name_conflict = export_path.exists()
+    else:
+        export_path, had_name_conflict = _choose_markdown_export_path(export_directory, preferred_file_name)
     note_markdown = result.knowledge_note_markdown
     enhanced_note_path = (
         result.visual_enhanced_note_artifact_path
@@ -66,12 +97,34 @@ def export_task_markdown(
         or result.artifacts.get("visual_note_path")
     )
     enhanced_note_markdown, _visual_asset_paths = _prepare_visual_note_for_export(
-        enhanced_note_path,
+        _resolve_task_artifact_path(enhanced_note_path, current_settings.tasks_dir),
         export_directory,
         export_path.name,
+        target=normalized_target,
     )
     if enhanced_note_markdown.strip() and result.visual_note_status in {"ready", "partial"}:
         note_markdown = enhanced_note_markdown
+    mindmap_source_path = _resolve_task_artifact_path(
+        result.mindmap_artifact_path or result.artifacts.get("mindmap_path"),
+        current_settings.tasks_dir,
+    )
+    mindmap_markdown, mindmap_asset_path = _prepare_mindmap_for_export(
+        mindmap_source_path,
+        export_directory,
+        export_path.name,
+    )
+    transcript_text = _resolve_transcript_text(result)
+    export_tags = (
+        _normalize_export_tags(tags)
+        if tags is not None
+        else _build_export_tags(
+            repository,
+            record.video_id,
+            title=title,
+            result=result,
+            note_markdown=note_markdown,
+        )
+    )
     markdown = build_task_markdown_export(
         title=title,
         overview=result.overview,
@@ -85,10 +138,12 @@ def export_task_markdown(
         task_id=record.task_id,
         created_at=record.created_at,
         exported_at=export_time,
-        tags=tags,
+        tags=export_tags,
         target=normalized_target,
-        mindmap_path=result.mindmap_artifact_path or result.artifacts.get("mindmap_path"),
-        transcript_text=_resolve_transcript_text(result),
+        mindmap_path=mindmap_source_path,
+        mindmap_markdown=mindmap_markdown,
+        mindmap_asset_path=mindmap_asset_path,
+        transcript_text=transcript_text,
         include_transcript=include_transcript,
     )
     _write_markdown_export_at(export_path, markdown)
@@ -114,6 +169,49 @@ def export_task_markdown(
     )
 
 
+def export_tasks_markdown(
+    repository: SqliteTaskRepository,
+    current_settings: ServiceSettings,
+    task_ids: list[str],
+    *,
+    target: Literal["markdown", "obsidian"] = "obsidian",
+    include_transcript: bool = False,
+    output_dir: str | None = None,
+) -> TaskMarkdownBatchExportResponse:
+    unique_task_ids = list(dict.fromkeys(str(task_id).strip() for task_id in task_ids if str(task_id).strip()))
+    if not unique_task_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个任务。")
+    if len(unique_task_ids) > 200:
+        raise HTTPException(status_code=400, detail="单次最多批量导出 200 条任务。")
+
+    exported: list[TaskMarkdownExportResponse] = []
+    failed: list[TaskMarkdownBatchExportFailure] = []
+    for task_id in unique_task_ids:
+        try:
+            exported.append(
+                export_task_markdown(
+                    repository,
+                    current_settings,
+                    task_id,
+                    target=target,
+                    include_transcript=include_transcript,
+                    output_dir=output_dir,
+                    overwrite_existing=True,
+                )
+            )
+        except HTTPException as exc:
+            failed.append(TaskMarkdownBatchExportFailure(task_id=task_id, error=str(exc.detail)))
+        except Exception as exc:
+            failed.append(TaskMarkdownBatchExportFailure(task_id=task_id, error=str(exc)))
+
+    return TaskMarkdownBatchExportResponse(
+        target_format=target,
+        requested_count=len(unique_task_ids),
+        exported=exported,
+        failed=failed,
+    )
+
+
 def export_task_transcript(
     repository: SqliteTaskRepository,
     current_settings: ServiceSettings,
@@ -131,11 +229,11 @@ def export_task_transcript(
     if not transcript:
         raise HTTPException(status_code=400, detail="当前任务缺少转写全文，暂时无法导出 transcript。")
 
-    output_dir_raw = str(output_dir or current_settings.output_dir or "").strip()
+    output_dir_raw = str(current_settings.output_dir or "").strip()
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先选择导出目录，或在设置中配置输出目录。")
 
-    export_directory = Path(output_dir_raw).expanduser()
+    export_directory = _resolve_export_directory(output_dir_raw)
     export_directory.mkdir(parents=True, exist_ok=True)
 
     video = repository.get_video_asset(record.video_id) if record.video_id else None
@@ -184,6 +282,194 @@ def _resolve_transcript_text(result) -> str:
         return ""
 
 
+def _normalize_export_tag(value: object) -> str:
+    return normalize_tag(value)
+
+
+_EXPORT_TAG_STOPWORDS = {
+    "内容概览",
+    "核心概览",
+    "关键要点",
+    "知识笔记",
+    "思维导图",
+    "转写全文",
+    "时间线",
+    "视频总结",
+    "总结",
+    "概览",
+    "来源",
+    "bilisum",
+    "video-summary",
+    "note/source",
+    "note/visual",
+    "evidence/visual",
+    "has/transcript",
+}
+_EXPORT_TAG_WORD_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "created",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "over",
+    "the",
+    "this",
+    "to",
+    "took",
+    "with",
+}
+_EXPORT_TAG_TRAILING_STOPWORDS = ("的", "和", "与", "及", "等", "中", "在", "为", "是")
+
+
+def _iter_explicit_note_tags(note_markdown: str):
+    for line in str(note_markdown or "").splitlines():
+        if re.match(r"^\s*#{1,6}(?:\s|$)", line):
+            continue
+        yield from (match.group(1) for match in re.finditer(r"(?<![\w#])#([\w\u4e00-\u9fff-]{2,40})", line))
+
+
+def _is_valid_export_tag(tag: str, stopwords: set[str]) -> bool:
+    normalized = tag.casefold()
+    return bool(
+        tag
+        and normalized not in stopwords
+        and normalized not in _EXPORT_TAG_WORD_STOPWORDS
+        and not tag.endswith(_EXPORT_TAG_TRAILING_STOPWORDS)
+        and 2 <= len(tag) <= 20
+        and not any(mark in tag for mark in "。！？；\n")
+    )
+
+
+def _build_export_tag_items(
+    repository: SqliteTaskRepository,
+    video_id: str | None,
+    *,
+    note_markdown: str,
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    seen: set[str] = set()
+    stopwords = {item.casefold() for item in _EXPORT_TAG_STOPWORDS}
+
+    def add(value: object, source: str, selected: bool) -> None:
+        tag = _normalize_export_tag(value)
+        if not _is_valid_export_tag(tag, stopwords) or tag_key(tag) in seen:
+            return
+        seen.add(tag_key(tag))
+        if len(items) < 12:
+            items.append({"tag": tag, "source": source, "selected": selected})
+
+    persisted_items = repository.list_video_tags(video_id) if video_id else []
+    for item in persisted_items:
+        source = str(getattr(item, "source", "manual") or "manual").casefold()
+        if source == "manual":
+            add(item.tag, source, True)
+
+    for tag in _iter_explicit_note_tags(note_markdown):
+        add(tag, "explicit", True)
+
+    for item in persisted_items:
+        source = str(getattr(item, "source", "manual") or "manual").casefold()
+        if source == "auto_llm":
+            add(item.tag, source, True)
+
+    return items
+
+
+def _build_export_tags(
+    repository: SqliteTaskRepository,
+    video_id: str | None,
+    *,
+    title: str,
+    result,
+    note_markdown: str,
+) -> list[str]:
+    del title, result
+    return [str(item["tag"]) for item in _build_export_tag_items(repository, video_id, note_markdown=note_markdown) if item["selected"]]
+
+
+def _normalize_export_tags(values: list[str]) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    stopwords = {item.casefold() for item in _EXPORT_TAG_STOPWORDS}
+    for value in values:
+        tag = _normalize_export_tag(value)
+        key = tag_key(tag)
+        if not _is_valid_export_tag(tag, stopwords) or key in seen:
+            continue
+        seen.add(key)
+        if len(items) < 12:
+            items.append(tag)
+    return items
+
+
+def _resolve_tag_preview_note_markdown(result) -> str:
+    if getattr(result, "visual_note_status", None) in {"ready", "partial"}:
+        visual_path = (
+            result.visual_enhanced_note_artifact_path
+            or result.visual_note_artifact_path
+            or result.artifacts.get("visual_enhanced_note_path")
+            or result.artifacts.get("visual_note_path")
+        )
+        if visual_path:
+            try:
+                visual_note = Path(visual_path).read_text(encoding="utf-8").strip()
+            except OSError:
+                visual_note = ""
+            if visual_note:
+                return visual_note
+    return result.knowledge_note_markdown
+
+
+def build_export_tag_preview(repository: SqliteTaskRepository, task_id: str) -> list[dict[str, object]]:
+    record = repository.get_task(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if record.status != TaskStatus.COMPLETED or record.result is None:
+        raise HTTPException(status_code=400, detail="仅已完成且有结果的任务可以预览导出标签。")
+    if not record.result.knowledge_note_markdown.strip():
+        raise HTTPException(status_code=400, detail="当前任务缺少知识笔记，暂时无法预览导出标签。")
+    return _build_export_tag_items(
+        repository,
+        record.video_id,
+        note_markdown=_resolve_tag_preview_note_markdown(record.result),
+    )
+
+
+def _prepare_mindmap_for_export(
+    mindmap_path: str | None,
+    export_directory: Path,
+    preferred_file_name: str,
+) -> tuple[str, str | None]:
+    if not mindmap_path:
+        return "", None
+    source_path = Path(mindmap_path)
+    try:
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "", None
+    if not isinstance(payload, dict):
+        return "", None
+    mermaid = build_mermaid_mindmap(payload)
+    if not mermaid:
+        return "", None
+
+    assets_dir = export_directory / f"{Path(preferred_file_name).stem}.assets"
+    destination = assets_dir / "mindmap.json"
+    try:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+    except OSError:
+        return mermaid, None
+    return mermaid, f"{assets_dir.name}/{destination.name}"
+
+
 _MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _VISUAL_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\(visual://([^)]+)\)")
 
@@ -192,6 +478,8 @@ def _prepare_visual_note_for_export(
     visual_note_path: str | None,
     export_directory: Path,
     preferred_file_name: str,
+    *,
+    target: str = "obsidian",
 ) -> tuple[str, list[Path]]:
     if not visual_note_path:
         return "", []
@@ -216,6 +504,8 @@ def _prepare_visual_note_for_export(
         shutil.copy2(source, destination)
         copied_paths.append(destination)
         relative_target = f"{assets_dir.name}/{destination.name}"
+        if target == "obsidian":
+            return f"![[{relative_target}]]"
         return f"![{alt_text}]({relative_target})"
 
     def replace_visual_image(match: re.Match[str]) -> str:
@@ -292,7 +582,7 @@ def _choose_markdown_export_path(directory: Path, file_name: str) -> tuple[Path,
 
 
 def _write_markdown_export_at(path: Path, content: str) -> None:
-    with path.open("x", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         handle.write(content)
 
 

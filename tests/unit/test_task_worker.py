@@ -5,6 +5,7 @@ from threading import Event
 
 from video_sum_core.models.tasks import InputType, TaskInput, TaskResult, TaskStatus
 from video_sum_core.pipeline.base import PipelineContext, PipelineEvent, PipelineRunner
+from video_sum_infra.config import ServiceSettings
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.schemas import VideoAssetRecord, VideoPageOptionResponse
 from video_sum_service.worker import TaskWorker
@@ -200,6 +201,39 @@ def test_worker_skips_auto_mindmap_when_disabled() -> None:
     worker._run_task(record.task_id)
 
     assert worker.mindmap_calls == []
+
+
+def test_worker_auto_exports_obsidian_note_when_enabled(tmp_path: Path) -> None:
+    repository = create_repository()
+    record = create_task(repository)
+    result = TaskResult(
+        overview="概览",
+        knowledge_note_markdown="# 测试笔记\n\n## 主题\n\n内容",
+        artifacts={"summary_path": str(tmp_path / "summary.json")},
+    )
+    settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        output_dir=str(tmp_path / "vault"),
+    )
+    worker = TaskWorker(
+        repository,
+        FakePipelineRunner(result),
+        auto_export_obsidian=True,
+        knowledge_index_settings=settings,
+    )
+
+    try:
+        worker._run_task(record.task_id)
+    finally:
+        worker.shutdown(wait=True)
+
+    refreshed = repository.get_task(record.task_id)
+    assert refreshed is not None and refreshed.result is not None
+    exported_path = Path(refreshed.result.artifacts["obsidian_note_path"])
+    assert exported_path.exists()
+    assert any(event.stage == "obsidian_exported" for event in repository.list_events(record.task_id))
 
 
 def test_worker_skips_auto_mindmap_when_required_inputs_are_missing() -> None:

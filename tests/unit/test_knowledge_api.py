@@ -654,6 +654,107 @@ def test_chat_knowledge_llm_normalizes_mimo_model(monkeypatch) -> None:
     assert calls[0]["json"]["model"] == "mimo-v2.5-pro"
 
 
+def test_chat_knowledge_llm_recovers_json_from_reasoning_only_response(monkeypatch) -> None:
+    settings = ServiceSettings(
+        knowledge_llm_mode="custom",
+        knowledge_llm_enabled=True,
+        knowledge_llm_base_url="https://api.example.com/v1",
+        knowledge_llm_api_key="test-key",
+        knowledge_llm_model="reasoning-model",
+    )
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"content":"","reasoning_content":"先思考。{\\"tags\\":[\\"人工智能\\",\\"视频分析\\"]}"}}]}'
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": '先思考。{"tags":["人工智能","视频分析"]}',
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            del url, headers
+            assert json.get("enable_thinking") is False
+            assert json.get("chat_template_kwargs") == {"enable_thinking": False}
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_service.knowledge.local_llm.httpx.Client", FakeClient)
+
+    content, _body = chat_knowledge_llm(
+        settings,
+        system_prompt="system",
+        user_prompt="user",
+        require_json=True,
+    )
+
+    assert content == '{"tags":["人工智能","视频分析"]}'
+
+
+def test_chat_knowledge_llm_uses_ollama_native_no_think_json_api(monkeypatch) -> None:
+    settings = ServiceSettings(
+        knowledge_llm_mode="custom",
+        knowledge_llm_enabled=True,
+        knowledge_llm_base_url="http://127.0.0.1:11434/v1",
+        knowledge_llm_api_key="ollama",
+        knowledge_llm_model="qwen3:14b",
+    )
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"message":{"role":"assistant","content":"{\\"tags\\":[\\"本地视频\\",\\"知识库\\"]}"}}'
+
+        def json(self) -> dict[str, object]:
+            return {"message": {"role": "assistant", "content": '{"tags":["本地视频","知识库"]}'}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            del headers
+            assert url == "http://127.0.0.1:11434/api/chat"
+            assert json["think"] is False
+            assert json["format"] == "json"
+            assert json["stream"] is False
+            assert json["options"]["num_predict"] >= 256
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_service.knowledge.local_llm.httpx.Client", FakeClient)
+
+    content, _body = chat_knowledge_llm(
+        settings,
+        system_prompt="system",
+        user_prompt="user",
+        max_tokens=200,
+        require_json=True,
+    )
+
+    assert content == '{"tags":["本地视频","知识库"]}'
+
+
 def test_knowledge_llm_availability_requires_api_key() -> None:
     missing_key = ServiceSettings(
         knowledge_llm_mode="custom",

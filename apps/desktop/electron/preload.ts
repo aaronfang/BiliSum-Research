@@ -144,6 +144,13 @@ export type StorageCleanupResult = {
 export type BilibiliCookieExportResult = {
   cookiesFile: string;
   cookieCount: number;
+  browser?: string;
+};
+
+export type YoutubeCookieExportResult = {
+  cookiesFile: string;
+  cookieCount: number;
+  browser: string;
 };
 
 const desktop = {
@@ -195,6 +202,10 @@ const desktop = {
   bilibili: {
     captureLoginCookies: () =>
       ipcRenderer.invoke("desktop:bilibili:capture-login-cookies") as Promise<BilibiliCookieExportResult>,
+  },
+  youtube: {
+    captureLoginCookies: () =>
+      ipcRenderer.invoke("desktop:youtube:capture-login-cookies") as Promise<YoutubeCookieExportResult>,
   },
   shell: {
     openPath: (targetPath: string) => ipcRenderer.invoke("desktop:shell:open-path", targetPath) as Promise<string>,

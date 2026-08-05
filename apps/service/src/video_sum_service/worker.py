@@ -9,6 +9,7 @@ from threading import Condition, Lock, Thread, current_thread
 from video_sum_core.models.tasks import InputType, TaskInput, TaskResult, TaskStatus
 from video_sum_core.pipeline.base import PipelineContext, PipelineRunner
 from video_sum_infra.config import ServiceSettings, normalize_visual_note_mode
+
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.schemas import TaskRecord
 from video_sum_service.video_assets import resolve_video_page
@@ -62,6 +63,7 @@ class TaskWorker:
         pipeline_runner: PipelineRunner,
         *,
         auto_generate_mindmap: bool = False,
+        auto_export_obsidian: bool = False,
         auto_generate_visual_evidence: bool = False,
         knowledge_index_auto_rebuild: str = "disabled",
         knowledge_index_settings: ServiceSettings | None = None,
@@ -71,6 +73,7 @@ class TaskWorker:
         self._repository = repository
         self._pipeline_runner = pipeline_runner
         self._auto_generate_mindmap = auto_generate_mindmap
+        self._auto_export_obsidian = auto_export_obsidian
         self._auto_generate_visual_evidence = auto_generate_visual_evidence
         self._knowledge_index_auto_rebuild = str(knowledge_index_auto_rebuild or "disabled")
         self._knowledge_index_settings = knowledge_index_settings or ServiceSettings(_env_file=None)
@@ -259,6 +262,36 @@ class TaskWorker:
     def _run_task_job(self, task: TaskRecord) -> None:
         self._run_task(task.task_id)
 
+    def _auto_export_note(self, task_id: str) -> None:
+        if not self._auto_export_obsidian:
+            return
+        try:
+            from video_sum_service.task_exports import export_task_markdown
+
+            response = export_task_markdown(
+                self._repository,
+                self._knowledge_index_settings,
+                task_id,
+                target="obsidian",
+                overwrite_existing=True,
+            )
+            self._repository.append_event(
+                task_id=task_id,
+                stage="obsidian_exported",
+                progress=100,
+                message="Obsidian 笔记已自动导出",
+                payload={"path": response.path},
+            )
+        except Exception as exc:
+            logger.exception("automatic Obsidian export failed task_id=%s error=%s", task_id, exc)
+            self._repository.append_event(
+                task_id=task_id,
+                stage="obsidian_export_failed",
+                progress=100,
+                message="Obsidian 笔记自动导出失败",
+                payload={"error": str(exc)},
+            )
+
     def _run_task(self, task_id: str) -> None:
         record = self._repository.get_task(task_id)
         if record is None:
@@ -334,6 +367,7 @@ class TaskWorker:
                 len(final_result.timeline),
                 len(final_result.transcript_text or ""),
             )
+            self._auto_export_note(task_id)
             if self._auto_generate_mindmap and self._can_auto_generate_mindmap(final_result):
                 self.submit_mindmap(task_id)
             if (
@@ -501,6 +535,7 @@ class TaskWorker:
                 }
             )
             self._repository.save_result(task_id, final_result)
+            self._auto_export_note(task_id)
             if status_value == "ready":
                 event_stage = "visual_completed"
                 event_message = "图文笔记生成完成"
@@ -616,6 +651,7 @@ class TaskWorker:
                 }
             )
             self._repository.save_result(task_id, final_result)
+            self._auto_export_note(task_id)
             self._repository.append_event(
                 task_id=task_id,
                 stage="mindmap_completed",

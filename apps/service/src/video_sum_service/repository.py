@@ -17,6 +17,7 @@ from video_sum_service.schemas import (
     VideoLibraryPreferencesResponse,
     VideoPageOptionResponse,
 )
+from video_sum_service.tag_utils import normalize_tag
 
 _UNSET = object()
 
@@ -164,6 +165,7 @@ class SqliteTaskRepository:
                 )
                 """
             )
+            self._normalize_existing_video_tags(cursor)
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS knowledge_index (
@@ -197,6 +199,36 @@ class SqliteTaskRepository:
         names = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in rows}
         if column not in names:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _normalize_existing_video_tags(self, cursor: sqlite3.Cursor) -> None:
+        rows = cursor.execute("SELECT video_id, tag, source, confidence, created_at FROM video_tags").fetchall()
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            normalized = normalize_tag(row["tag"])
+            if normalized:
+                grouped.setdefault((row["video_id"], normalized), []).append(row)
+            else:
+                cursor.execute("DELETE FROM video_tags WHERE video_id = ? AND tag = ?", (row["video_id"], row["tag"]))
+        for (video_id, normalized), items in grouped.items():
+            if len(items) == 1 and items[0]["tag"] == normalized:
+                continue
+            winner = max(
+                items,
+                key=lambda item: (
+                    str(item["source"] or "").casefold() == "manual",
+                    float(item["confidence"] or 0),
+                    str(item["created_at"] or ""),
+                ),
+            )
+            placeholders = ", ".join("?" for _ in items)
+            cursor.execute(
+                f"DELETE FROM video_tags WHERE video_id = ? AND tag IN ({placeholders})",
+                (video_id, *(item["tag"] for item in items)),
+            )
+            cursor.execute(
+                "INSERT INTO video_tags (video_id, tag, source, confidence, created_at) VALUES (?, ?, ?, ?, ?)",
+                (video_id, normalized, winner["source"], float(winner["confidence"]), winner["created_at"]),
+            )
 
     def _canonical_family_pattern(self, canonical_id: str) -> tuple[str, str]:
         base = str(canonical_id or "").split("?", 1)[0]
@@ -907,7 +939,7 @@ class SqliteTaskRepository:
         return [video for video_id in ordered_ids if (video := self.get_video_asset(video_id)) is not None]
 
     def add_video_tag(self, video_id: str, tag: str, source: str = "manual", confidence: float = 1.0) -> bool:
-        normalized_tag = str(tag or "").strip()
+        normalized_tag = normalize_tag(tag)
         if not normalized_tag:
             return False
 
@@ -939,7 +971,7 @@ class SqliteTaskRepository:
         return True
 
     def remove_video_tag(self, video_id: str, tag: str) -> bool:
-        normalized_tag = str(tag or "").strip()
+        normalized_tag = normalize_tag(tag)
         if not normalized_tag:
             return False
         with self._lock, sqlite_cursor(self._connection) as cursor:

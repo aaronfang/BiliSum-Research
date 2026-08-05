@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from email.parser import Parser
 import importlib
-import io
 import json
 import os
 import re
@@ -11,12 +9,12 @@ import subprocess
 import sys
 import tempfile
 import threading
-from types import SimpleNamespace
-
 import time
 import venv
 from dataclasses import fields
+from email.parser import Parser
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -247,6 +245,16 @@ def runtime_subprocess_env(runtime_channel: str) -> dict[str, str]:
     pythonpath_entries = [str(path) for path in runtime_pythonpath_dirs(runtime_channel)]
     if pythonpath_entries:
         env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    # Preserve the interactive user's PATH (not just the service launcher
+    # PATH) so yt-dlp can discover Node.js for YouTube EJS challenge solving.
+    # Without this, the service may start from Electron with a reduced PATH,
+    # omit node, and YouTube returns only storyboard images / no video.
+    node_executable = shutil.which("node")
+    if node_executable:
+        node_dir = str(Path(node_executable).resolve().parent)
+        env["PATH"] = os.pathsep.join(
+            [node_dir, *(entry for entry in env.get("PATH", "").split(os.pathsep) if entry and entry != node_dir)]
+        )
     ffmpeg_exe = ffmpeg_location()
     if ffmpeg_exe is not None:
         path_entries.append(str(ffmpeg_exe.parent))
@@ -1118,7 +1126,77 @@ def create_source_runtime(runtime_channel: str) -> Path:
     if python_executable is None:
         raise HTTPException(status_code=500, detail="Managed runtime creation failed: python.exe missing.")
     install_workspace_packages(python_executable, runtime_channel=runtime_channel)
+    ensure_dev_pythonpath(runtime_channel)
     return runtime_dir
+
+
+def _managed_dev_runtime_dir(runtime_channel: str) -> Path:
+    normalized = normalize_runtime_channel(runtime_channel)
+    if normalized == "base":
+        return managed_runtime_dir("base")
+    if normalized == "gpu-cu124":
+        return managed_runtime_dir("gpu-cu124")
+    if normalized == "gpu-cu126":
+        return managed_runtime_dir("gpu-cu126")
+    if normalized == "gpu-cu128":
+        return managed_runtime_dir("gpu-cu128")
+    raise HTTPException(status_code=400, detail="Unsupported runtime channel.")
+
+
+def ensure_dev_pythonpath(runtime_channel: str) -> Path | None:
+    """Point a managed runtime's subprocesses at the live project source.
+
+    In dev (non-frozen) mode, the workspace packages are pip-installed as
+    static snapshots into the runtime's ``site-packages``.  Any subprocess
+    that uses ``runtime_pythonpath_dirs`` (probe, transcription worker,
+    local ASR worker) would then import the *stale snapshot* instead of the
+    current source.  Writing an absolute ``pythonpath.pth`` in the runtime
+    root prepends ``packages/*/src`` and ``apps/service/src`` to the
+    subprocess PYTHONPATH (before ``site-packages``), so edits to the
+    source tree are picked up without reinstalling.
+
+    Packaged builds are untouched: frozen mode returns ``None`` and the
+    bundled relative ``pythonpath.pth`` is preserved.
+
+    Returns the ``pythonpath.pth`` path written, or ``None`` when the
+    runtime is unavailable / not a managed runtime.
+    """
+    if is_frozen():
+        return None
+    runtime_dir = _managed_dev_runtime_dir(runtime_channel)
+    if not runtime_dir.exists():
+        return None
+
+    root = repo_root()
+    source_entries: list[str] = [
+        str(root / "packages" / "infra" / "src"),
+        str(root / "packages" / "core" / "src"),
+        str(root / "apps" / "service" / "src"),
+    ]
+    target = runtime_dir / "pythonpath.pth"
+    content = "\n".join(source_entries + [""])
+    try:
+        existing = target.read_text(encoding="utf-8") if target.exists() else None
+    except OSError:
+        existing = None
+    if existing == content:
+        return target
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError:
+        logger.warning(
+            "failed to write dev pythonpath.pth runtime_channel=%s path=%s",
+            _sanitize_for_log(runtime_channel),
+            _sanitize_for_log(str(target)),
+        )
+        return None
+    logger.info(
+        "wrote dev pythonpath.pth runtime_channel=%s path=%s entries=%d",
+        _sanitize_for_log(runtime_channel),
+        _sanitize_for_log(str(target)),
+        len(source_entries),
+    )
+    return target
 
 
 def _ensure_runtime_sitecustomize(runtime_channel: str) -> None:
@@ -1182,6 +1260,7 @@ def ensure_runtime_channel(runtime_channel: str) -> Path | None:
         python_executable = runtime_python_executable("base")
         if python_executable is not None:
             _ensure_runtime_sitecustomize("base")
+            ensure_dev_pythonpath("base")
             return managed_runtime_dir("base")
         if not is_frozen():
             _ensure_runtime_sitecustomize("base")
@@ -1202,6 +1281,7 @@ def ensure_runtime_channel(runtime_channel: str) -> Path | None:
     target_matches_base = runtime_metadata_matches_base(target_metadata, base_metadata)
     if target_ready and target_matches_base:
         _ensure_runtime_sitecustomize(runtime_channel)
+        ensure_dev_pythonpath(runtime_channel)
         return target_dir
 
     if target_ready and target_dir.exists():
@@ -1211,10 +1291,12 @@ def ensure_runtime_channel(runtime_channel: str) -> Path | None:
             lambda: sync_runtime_base(target_dir, base_dir, runtime_channel),
         )
         _ensure_runtime_sitecustomize(runtime_channel)
+        ensure_dev_pythonpath(runtime_channel)
         return target_dir
 
     replace_runtime_with_base_copy(target_dir, base_dir, runtime_channel, backup_dir)
     _ensure_runtime_sitecustomize(runtime_channel)
+    ensure_dev_pythonpath(runtime_channel)
     return target_dir
 
 
@@ -1978,6 +2060,14 @@ def build_worker(
         "llm_api_key": runtime_settings.llm_api_key,
         "llm_base_url": runtime_settings.llm_base_url,
         "llm_model": runtime_settings.llm_model,
+        "transcript_fusion_enabled": bool(
+            runtime_settings.visual_evidence_enabled
+            and runtime_settings.visual_multimodal_enabled
+            and runtime_settings.visual_evidence_use_llm
+        ),
+        "transcript_fusion_allow_cloud_asr": (
+            runtime_settings.transcript_fusion_allow_cloud_asr
+        ),
         "visual_evidence_enabled": runtime_settings.visual_evidence_enabled,
         "visual_note_mode": runtime_settings.visual_note_mode,
         "visual_multimodal_enabled": runtime_settings.visual_multimodal_enabled,
@@ -2014,6 +2104,8 @@ def build_worker(
         "summary_chunk_retry_count": runtime_settings.summary_chunk_retry_count,
         "ytdlp_cookies_file": runtime_settings.ytdlp_cookies_file,
         "ytdlp_cookies_browser": runtime_settings.ytdlp_cookies_browser,
+        "ytdlp_youtube_cookies_file": runtime_settings.ytdlp_youtube_cookies_file,
+        "ytdlp_youtube_cookies_browser": runtime_settings.ytdlp_youtube_cookies_browser,
     }
     supported_pipeline_fields = {field.name for field in fields(PipelineSettings)}
     pipeline_settings = PipelineSettings(
@@ -2027,6 +2119,7 @@ def build_worker(
         repository=repository,
         pipeline_runner=RealPipelineRunner(pipeline_settings),
         auto_generate_mindmap=current_settings.auto_generate_mindmap,
+        auto_export_obsidian=current_settings.auto_export_obsidian,
         auto_generate_visual_evidence=current_settings.visual_evidence_enabled and current_settings.visual_note_mode != "text",
         knowledge_index_auto_rebuild=(
             current_settings.knowledge_index_auto_rebuild
@@ -2100,6 +2193,7 @@ def serialize_settings(
         "prompt_presets_path": current_settings.prompt_presets_path,
         "llm_enabled": current_settings.llm_enabled,
         "auto_generate_mindmap": current_settings.auto_generate_mindmap,
+        "auto_export_obsidian": current_settings.auto_export_obsidian,
         "visual_note_mode": current_settings.visual_note_mode,
         "visual_evidence_enabled": current_settings.visual_evidence_enabled,
         "visual_multimodal_enabled": current_settings.visual_multimodal_enabled,
@@ -2159,6 +2253,8 @@ def serialize_settings(
         "summary_chunk_retry_count": current_settings.summary_chunk_retry_count,
         "ytdlp_cookies_file": current_settings.ytdlp_cookies_file,
         "ytdlp_cookies_browser": current_settings.ytdlp_cookies_browser,
+        "ytdlp_youtube_cookies_file": current_settings.ytdlp_youtube_cookies_file,
+        "ytdlp_youtube_cookies_browser": current_settings.ytdlp_youtube_cookies_browser,
         "settings_file_exists": settings_manager.has_persisted_settings,
         "defaults": {
             "knowledge_note_system_prompt": DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT,

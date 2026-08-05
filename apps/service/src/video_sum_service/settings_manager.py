@@ -75,6 +75,7 @@ class SettingsUpdatePayload(BaseModel):
     funasr_spk_model: str | None = None
     funasr_hub: str | None = None
     funasr_hotword: str | None = None
+    transcript_fusion_allow_cloud_asr: bool | None = None
     cuda_variant: str | None = None
     runtime_channel: str | None = None
     output_dir: str | None = None
@@ -86,6 +87,7 @@ class SettingsUpdatePayload(BaseModel):
     prompt_presets_path: str | None = None
     llm_enabled: bool | None = None
     auto_generate_mindmap: bool | None = None
+    auto_export_obsidian: bool | None = None
     visual_note_mode: str | None = None
     visual_evidence_enabled: bool | None = None
     visual_multimodal_enabled: bool | None = None
@@ -144,6 +146,8 @@ class SettingsUpdatePayload(BaseModel):
     summary_chunk_retry_count: int | None = None
     ytdlp_cookies_file: str | None = None
     ytdlp_cookies_browser: str | None = None
+    ytdlp_youtube_cookies_file: str | None = None
+    ytdlp_youtube_cookies_browser: str | None = None
 
 
 class SettingsManager:

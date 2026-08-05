@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,110 @@ from video_sum_core.pipeline.real import PipelineSettings, RealPipelineRunner
 
 class TestFunasrProvider:
     def test_funasr_routing(self, tmp_path):
+        settings = PipelineSettings(
+            tasks_dir=tmp_path,
+            transcription_provider="funasr",
+            local_asr_available=True,
+            funasr_model="paraformer-zh",
+            funasr_device="cpu",
+        )
+        runner = RealPipelineRunner(settings)
+
+        audio_path = tmp_path / "test.wav"
+        audio_path.write_text("dummy")
+
+        with patch.object(runner, "_transcribe_with_funasr") as mock_funasr:
+            mock_funasr.return_value = ("transcript", [{"start": 0, "end": 1, "text": "test"}])
+            result = runner._transcribe(audio_path, None, lambda *args: None)
+            mock_funasr.assert_called_once()
+            assert result[0] == "transcript"
+
+    def test_auto_model_resolves_by_language(self, tmp_path):
+        from video_sum_infra.config import resolve_funasr_model
+
+        # English maps to the multilingual SenseVoiceSmall: FunASR's
+        # "paraformer-en" alias actually points at a Chinese model whose
+        # README describes Mandarin training data, so it transcribes English
+        # into nonsense.
+        assert resolve_funasr_model("zh", "auto") == "paraformer-zh"
+        assert resolve_funasr_model("en", "auto") == "iic/SenseVoiceSmall"
+        assert resolve_funasr_model("zh-CN", "auto") == "paraformer-zh"
+        assert resolve_funasr_model("en-US", "auto") == "iic/SenseVoiceSmall"
+        assert resolve_funasr_model("en", "") == "iic/SenseVoiceSmall"
+        assert resolve_funasr_model("ja", "auto") == "iic/SenseVoiceSmall"
+        assert resolve_funasr_model(None, "auto") == "paraformer-zh"
+        # Explicit configured model wins over language detection
+        assert resolve_funasr_model("en", "paraformer-zh") == "paraformer-zh"
+
+    def test_funasr_aux_models_preserve_vad_and_punc(self):
+        from video_sum_infra.config import resolve_funasr_aux_models
+
+        # VAD MUST be preserved for every model: without it the whole audio
+        # file is fed to the GPU in one pass and crashes with CUDA OOM.
+        # PUNC (ct-punc) is preserved too so transcripts keep punctuation —
+        # SenseVoiceSmall does NOT emit punctuation on its own.
+        assert resolve_funasr_aux_models(
+            "iic/SenseVoiceSmall",
+            vad_model="fsmn-vad",
+            punc_model="ct-punc",
+            spk_model="cam++",
+        ) == ("fsmn-vad", "ct-punc", "cam++")
+        assert resolve_funasr_aux_models(
+            "SenseVoiceSmall",
+            vad_model="fsmn-vad",
+            punc_model="ct-punc",
+            spk_model="",
+        ) == ("fsmn-vad", "ct-punc", "")
+        assert resolve_funasr_aux_models(
+            "paraformer-zh",
+            vad_model="fsmn-vad",
+            punc_model="ct-punc",
+            spk_model="cam++",
+        ) == ("fsmn-vad", "ct-punc", "cam++")
+
+    def test_language_detection_from_metadata(self, tmp_path):
+        settings = PipelineSettings(tasks_dir=tmp_path)
+        runner = RealPipelineRunner(settings)
+
+        assert runner._detect_video_language({"language": "en"}, "Some English title") == "en"
+        assert runner._detect_video_language({"language": "zh-CN"}, "某中文标题") == "zh"
+        assert runner._detect_video_language({"languages": ["en"]}, "Title") == "en"
+        # CJK title fallback
+        assert runner._detect_video_language(None, "这是一个中文视频的标题") == "zh"
+        assert runner._detect_video_language(None, "How Blender builds animation systems") == "en"
+        assert runner._detect_video_language(None, "") == "other"
+
+    def test_funasr_auto_model_passed_to_subprocess(self, tmp_path):
+        settings = PipelineSettings(
+            tasks_dir=tmp_path,
+            transcription_provider="funasr",
+            local_asr_available=True,
+            funasr_available=True,
+            funasr_model="auto",
+            funasr_device="cpu",
+            funasr_vad_model="fsmn-vad",
+            funasr_punc_model="ct-punc",
+        )
+        runner = RealPipelineRunner(settings)
+
+        audio_path = tmp_path / "test.wav"
+        audio_path.write_text("dummy")
+
+        with patch.object(runner, "_run_funasr_subprocess") as mock_run:
+            mock_run.return_value = ("transcript", [{"start": 0, "end": 3, "text": "transcript"}])
+            transcript, segments = runner._transcribe_with_funasr(
+                audio_path, None, lambda *args: None, language="en"
+            )
+            assert transcript == "transcript"
+            called_kwargs = mock_run.call_args.kwargs
+            assert called_kwargs["model_name"] == "iic/SenseVoiceSmall"
+            # SenseVoice uses native ITN for an explicitly detected language;
+            # VAD stays enabled, while the slow full-text punc pass is skipped.
+            assert called_kwargs["vad_model"] == "fsmn-vad"
+            assert called_kwargs["punc_model"] == ""
+            assert called_kwargs["language"] == "en"
+
+    def test_funasr_not_available_raises(self, tmp_path):
         settings = PipelineSettings(
             tasks_dir=tmp_path,
             transcription_provider="funasr",
@@ -192,19 +297,23 @@ class TestFunasrProvider:
                 with patch("video_sum_core.pipeline.real.time.monotonic") as mock_time:
                     mock_time.side_effect = [0, 0, 9999]
 
-                    with pytest.raises(VideoSumError, match="timed out|no progress"):
-                        runner._run_funasr_subprocess(
-                            audio_path=audio_path,
-                            duration=1.0,
-                            emit=lambda *args: None,
-                            model_name="paraformer-zh",
-                            device="cpu",
-                            vad_model="",
-                            punc_model="",
-                            spk_model="",
-                            hub="ms",
-                            hotword="",
-                        )
+                    # ``_kill_process_tree`` invokes ``subprocess.run(["taskkill", ...])``
+                    # on Windows, which must be tolerated even though
+                    # ``subprocess.Popen`` is mocked here.
+                    with patch("video_sum_core.pipeline.real.subprocess.run", return_value=subprocess.CompletedProcess([], 1)):
+                        with pytest.raises(VideoSumError, match="timed out|no progress"):
+                            runner._run_funasr_subprocess(
+                                audio_path=audio_path,
+                                duration=1.0,
+                                emit=lambda *args: None,
+                                model_name="paraformer-zh",
+                                device="cpu",
+                                vad_model="",
+                                punc_model="",
+                                spk_model="",
+                                hub="ms",
+                                hotword="",
+                            )
                     mock_process.kill.assert_called_once()
 
     def test_run_funasr_subprocess_crash_with_valid_output(self, tmp_path):

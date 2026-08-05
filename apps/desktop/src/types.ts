@@ -264,6 +264,17 @@ export type TaskVisualEvidenceResponse = {
 export type TaskMarkdownExportTarget = "markdown" | "obsidian";
 export type TaskExportTarget = TaskMarkdownExportTarget | "transcript";
 
+export type TaskMarkdownTagPreviewItem = {
+  tag: string;
+  source: "manual" | "explicit" | "auto_llm" | string;
+  selected: boolean;
+};
+
+export type TaskMarkdownTagPreviewResponse = {
+  task_id: string;
+  items: TaskMarkdownTagPreviewItem[];
+};
+
 export type TaskMarkdownExportResponse = {
   task_id: string;
   target_format: TaskExportTarget;
@@ -272,6 +283,13 @@ export type TaskMarkdownExportResponse = {
   file_name: string;
   overwritten: boolean;
   artifact_key: string;
+};
+
+export type TaskMarkdownBatchExportResponse = {
+  target_format: TaskMarkdownExportTarget;
+  requested_count: number;
+  exported: TaskMarkdownExportResponse[];
+  failed: Array<{ task_id: string; error: string }>;
 };
 
 export type TaskEvent = {
@@ -412,6 +430,7 @@ export type ServiceSettings = {
   prompt_presets_path: string;
   llm_enabled: boolean;
   auto_generate_mindmap: boolean;
+  auto_export_obsidian: boolean;
   visual_note_mode: VisualNoteMode;
   visual_evidence_enabled: boolean;
   visual_multimodal_enabled: boolean;
@@ -471,6 +490,8 @@ export type ServiceSettings = {
   summary_chunk_retry_count: number;
   ytdlp_cookies_file: string;
   ytdlp_cookies_browser: string;
+  ytdlp_youtube_cookies_file: string;
+  ytdlp_youtube_cookies_browser: string;
   settings_file_exists?: boolean;
   defaults?: {
     knowledge_note_system_prompt?: string;
