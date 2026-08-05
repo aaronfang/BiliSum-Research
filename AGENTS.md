@@ -44,6 +44,10 @@ Before changing behavior, read:
   checks, unresolved review conversations, or the repository's branch protection.
 - Do not merge a PR, create a tag, publish a GitHub Release, or push release artifacts unless
   the user explicitly asks for that delivery step after the PR is approved and green.
+- After a PR is merged and `master` is confirmed healthy, delete its remote and local topic
+  branches. Never delete an unmerged branch, the current branch, a branch with unique commits,
+  or any branch/worktree containing uncommitted changes. Keep release or long-lived maintenance
+  branches only when the repository explicitly requires them.
 - Releases contain only changes already merged to `master`. The repository-owned release
   workflow may create its generated version commit and tag after a merge; this is the sole
   direct-mutation exception and is not permission for hand-authored changes.

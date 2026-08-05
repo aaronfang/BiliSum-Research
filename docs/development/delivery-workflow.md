@@ -29,7 +29,8 @@ upstream synchronization, uses this sequence:
 5. Push the topic branch only.
 6. Open a PR to `master` containing `Closes #<issue-number>` or an equivalent closing keyword.
 7. Resolve review conversations and wait for every required check to pass.
-8. Merge through GitHub. Delete the topic branch when it is no longer needed.
+8. Merge through GitHub. After the merge and post-merge checks are healthy, safely delete the
+   remote and local topic branch.
 9. Publish a release only from the resulting `master` state.
 
 Example:
@@ -60,6 +61,33 @@ A PR is mergeable only when:
 
 Branch protection is the enforcement layer. `AGENTS.md` is the persistent instruction layer for
 automation and future conversations.
+
+## Branch Cleanup
+
+Topic branches are temporary. Delete them after their PR is merged and the resulting `master`
+commit is confirmed healthy; the merged PR and Git history retain the review and commits.
+
+Before deleting a branch, confirm all of the following:
+
+- the PR is merged rather than merely closed;
+- the merge commit is present on `origin/master`;
+- required post-merge checks are not failing;
+- the branch has no unique work that was excluded from the merge;
+- no worktree using the branch contains uncommitted changes.
+
+Then clean up from a safe branch or worktree:
+
+```bash
+git switch master
+git pull --ff-only origin master
+git push origin --delete <topic-branch>
+git branch -d <topic-branch>
+git fetch --prune
+```
+
+Never force-delete an unmerged branch to make cleanup succeed. Do not switch branches or remove
+a worktree when that could carry, overwrite, or discard uncommitted changes. Release branches and
+long-lived maintenance branches are retained only when their lifecycle is explicitly documented.
 
 ## Release Gate
 
