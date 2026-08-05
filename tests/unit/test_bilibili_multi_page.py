@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+from fastapi import HTTPException
+from yt_dlp.utils import DownloadError
+
 from video_sum_core.utils import normalize_video_url
 from video_sum_service import app as service_app
 from video_sum_service.repository import SqliteTaskRepository
@@ -419,6 +423,107 @@ def test_list_videos_refreshes_missing_bilibili_cover(monkeypatch) -> None:
     assert response[0].cover_url == "/media/covers/BV1xx411c7mD.jpg"
     assert refreshed is not None
     assert refreshed.cover_url == "/media/covers/BV1xx411c7mD.jpg"
+
+
+def test_extract_video_info_maps_youtube_bot_error_to_actionable_http_error(monkeypatch) -> None:
+    class _FailingYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            pass
+
+        def __enter__(self) -> "_FailingYoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+            raise DownloadError(
+                "ERROR: [youtube] Xdy1vkhSz-M: Sign in to confirm you're not a bot."
+            )
+
+    monkeypatch.setattr(service_app.video_assets, "YoutubeDL", _FailingYoutubeDL)
+    monkeypatch.setattr(service_app.video_assets, "DownloadError", DownloadError)
+
+    with pytest.raises(HTTPException) as error:
+        service_app.video_assets.extract_video_info(
+            "https://www.youtube.com/watch?v=Xdy1vkhSz-M"
+        )
+
+    assert error.value.status_code == 400
+    assert "YouTube" in str(error.value.detail)
+    assert "Cookies 文件" in str(error.value.detail)
+
+
+def test_build_ydl_probe_options_uses_configured_cookie_browser(monkeypatch) -> None:
+    current_settings = service_app.video_assets.settings_manager.current
+    monkeypatch.setattr(
+        service_app.video_assets.settings_manager,
+        "_settings",
+        current_settings.model_copy(update={"ytdlp_cookies_file": "", "ytdlp_cookies_browser": "chrome"}),
+    )
+
+    options = service_app.video_assets.build_ydl_probe_options()
+
+    assert options["cookiesfrombrowser"] == ("chrome",)
+    assert "cookiefile" not in options
+
+
+def test_build_ydl_probe_options_keeps_bilibili_and_youtube_cookies_separate(monkeypatch, tmp_path) -> None:
+    bilibili_file = tmp_path / "bilibili.txt"
+    youtube_file = tmp_path / "youtube.txt"
+    bilibili_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    youtube_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    current_settings = service_app.video_assets.settings_manager.current
+    monkeypatch.setattr(
+        service_app.video_assets.settings_manager,
+        "_settings",
+        current_settings.model_copy(
+            update={
+                "ytdlp_cookies_file": str(bilibili_file),
+                "ytdlp_cookies_browser": "",
+                "ytdlp_youtube_cookies_file": str(youtube_file),
+                "ytdlp_youtube_cookies_browser": "",
+            }
+        ),
+    )
+
+    bilibili_options = service_app.video_assets.build_ydl_probe_options("https://www.bilibili.com/video/BV1xx411c7mD")
+    youtube_options = service_app.video_assets.build_ydl_probe_options("https://www.youtube.com/watch?v=Xdy1vkhSz-M")
+
+    assert bilibili_options["cookiefile"] == str(bilibili_file)
+    assert youtube_options["cookiefile"] == str(youtube_file)
+
+
+def test_extract_video_info_configures_available_javascript_runtime(monkeypatch) -> None:
+    captured_options: dict[str, object] = {}
+
+    class _YoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            captured_options.update(options)
+
+        def __enter__(self) -> "_YoutubeDL":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, object]:
+            return {"id": "Xdy1vkhSz-M", "title": "测试视频"}
+
+    monkeypatch.setattr(service_app.video_assets, "YoutubeDL", _YoutubeDL)
+    monkeypatch.setattr(service_app.video_assets, "DownloadError", DownloadError)
+    monkeypatch.setattr(
+        service_app.video_assets.shutil,
+        "which",
+        lambda name: None if name == "deno" else "C:/Program Files/nodejs/node.exe",
+    )
+
+    info = service_app.video_assets.extract_video_info(
+        "https://www.youtube.com/watch?v=Xdy1vkhSz-M"
+    )
+
+    assert info["title"] == "测试视频"
+    assert captured_options["js_runtimes"] == {"node": {"path": "C:/Program Files/nodejs/node.exe"}}
 
 
 def test_probe_video_asset_returns_youtube_single_video(monkeypatch) -> None:

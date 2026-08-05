@@ -9,7 +9,7 @@ description = "Core domain logic for the local video summarizer."
 requires-python = ">=3.12"
 dependencies = [
   "pydantic>=2.10,<3.0",
-  "yt-dlp>=2025.3.31",
+  "yt-dlp[default]>=2025.3.31",
   "httpx>=0.28,<1.0",
   "video-sum-infra",
 ]

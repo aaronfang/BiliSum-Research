@@ -110,7 +110,10 @@ export function describeUserFacingErrorMessage(rawMessage?: string | null): stri
   if (/status 401|authentication failed|unauthorized|invalid api key|incorrect api key/.test(normalized)) {
     return "API Key 校验失败。请检查密钥是否正确、是否过期，或是否复制了多余空格。";
   }
-  if (/status 403|forbidden|permission denied/.test(normalized)) {
+  if (/youtube|yt[-_ ]?dlp|unable to download video data|sign in to confirm/.test(normalized) && /403|forbidden|permission denied/.test(normalized)) {
+    return "YouTube 拒绝了当前下载请求（HTTP 403）。请更新 YouTube Cookies，或重新捕获浏览器登录态后再试。";
+  }
+  if (/status 403|http 403|forbidden|permission denied/.test(normalized)) {
     return "当前账号没有访问这个模型或接口的权限。请检查服务商后台的权限、余额或模型开通状态。";
   }
   if (/status 429|rate limit|too many requests/.test(normalized)) {

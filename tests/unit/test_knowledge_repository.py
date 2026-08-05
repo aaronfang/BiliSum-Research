@@ -46,6 +46,51 @@ def test_repository_promotes_manual_tag_over_auto_tag() -> None:
     assert tags[0].confidence == 1.0
 
 
+def test_repository_normalizes_tag_format_before_persisting() -> None:
+    repository = create_repository()
+    video = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="BV-knowledge-tag-normalize",
+            platform="bilibili",
+            title="标签规范化",
+            source_url="https://www.bilibili.com/video/BV-knowledge-tag-normalize",
+        )
+    )
+
+    assert repository.add_video_tag(video.video_id, " ＃AI  工具 ") is True
+    assert repository.add_video_tag(video.video_id, "#AI 工具") is True
+
+    tags = repository.list_video_tags(video.video_id)
+    assert len(tags) == 1
+    assert tags[0].tag == "AI-工具"
+
+
+def test_repository_normalizes_existing_duplicate_tags_on_initialize() -> None:
+    repository = create_repository()
+    video = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="BV-knowledge-tag-migrate",
+            platform="bilibili",
+            title="历史标签",
+            source_url="https://www.bilibili.com/video/BV-knowledge-tag-migrate",
+        )
+    )
+    repository._connection.execute(
+        "INSERT INTO video_tags (video_id, tag, source, confidence, created_at) VALUES (?, ?, ?, ?, ?)",  # noqa: SLF001
+        (video.video_id, " AI  工具 ", "auto_llm", 0.67, "2026-01-01T00:00:00+00:00"),
+    )
+    repository._connection.execute(
+        "INSERT INTO video_tags (video_id, tag, source, confidence, created_at) VALUES (?, ?, ?, ?, ?)",  # noqa: SLF001
+        (video.video_id, "ＡI 工具", "manual", 1.0, "2026-01-02T00:00:00+00:00"),
+    )
+    repository._connection.commit()  # noqa: SLF001
+
+    repository.initialize()
+    tags = repository.list_video_tags(video.video_id)
+
+    assert [(item.tag, item.source) for item in tags] == [("AI-工具", "manual")]
+
+
 def test_repository_replaces_knowledge_chunks_and_cleans_up_on_video_delete() -> None:
     repository = create_repository()
     video = repository.upsert_video_asset(

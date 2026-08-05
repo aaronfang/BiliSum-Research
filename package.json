@@ -2,7 +2,7 @@
   "name": "bilisum-workspace",
   "private": true,
   "scripts": {
-    "dev": "npm --prefix apps/desktop run dev",
+    "dev": "node scripts/dev-cleanup.mjs && npm --prefix apps/desktop run dev:run",
     "dev:macUI": "npm --prefix apps/desktop run dev:macUI",
     "dev:desktop": "npm --prefix apps/desktop run dev",
     "build:web": "npm --prefix apps/desktop run build:renderer",

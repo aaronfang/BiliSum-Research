@@ -475,6 +475,83 @@ def normalize_funasr_hub(value: str | None, default: str = "ms") -> str:
     return "hf" if normalized in ("hf", "huggingface") else "ms"
 
 
+def normalize_funasr_model(value: str | None, default: str = "auto") -> str:
+    """Normalize a FunASR model selector.
+
+    Supports the special value ``auto`` (pick the model based on the
+    detected video language), plus explicit FunASR model names / hub IDs.
+    """
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+    if normalized.lower() == "auto":
+        return "auto"
+    return normalized
+
+
+# Language -> preferred FunASR ASR model.
+#
+# NOTE: ``paraformer-en`` is NOT used for English.  FunASR's alias points to
+# ``iic/speech_paraformer-large-vad-punc_asr_nat-en-16k-common-vocab10020``,
+# whose ModelScope README describes it as a *Chinese* (Mandarin, 10020 chars)
+# model — the "en" in the repo id is misleading, and it transcribes English
+# audio into nonsense.  English therefore uses SenseVoiceSmall, the native
+# multilingual model (zh/en/ja/ko/yue) that produces clean English output.
+FUNASR_MODEL_BY_LANGUAGE: dict[str, str] = {
+    "zh": "paraformer-zh",
+    "en": "iic/SenseVoiceSmall",
+    "other": "iic/SenseVoiceSmall",
+}
+
+
+def resolve_funasr_model(language: str | None, configured: str | None = None) -> str:
+    """Resolve the effective FunASR model for a detected language.
+
+    ``configured`` may be ``"auto"`` (or empty) to select by language, or
+    an explicit model name that is used as-is.
+    """
+    selector = str(configured or "").strip() or "auto"
+    if selector.lower() != "auto":
+        return selector
+    key = "zh"
+    norm = str(language or "").strip().lower()
+    if norm.startswith("en"):
+        key = "en"
+    elif norm.startswith("zh"):
+        key = "zh"
+    elif norm and norm not in {"auto", ""}:
+        key = "other"
+    return FUNASR_MODEL_BY_LANGUAGE.get(key, FUNASR_MODEL_BY_LANGUAGE["zh"])
+
+
+# SenseVoiceSmall DOES NOT produce punctuation on its own (its raw output is
+# one continuous stream of words), so the external ``ct-punc`` must be kept to
+# restore commas / periods.  It still NEEDS an explicit VAD model for
+# long-audio segmentation: without VAD, AutoModel.generate() feeds the entire
+# file (e.g. a 51-minute talk) to the GPU in a single pass and dies with
+# "CUDA out of memory".  Both VAD and PUNC are therefore preserved.
+def resolve_funasr_aux_models(
+    model_name: str | None,
+    *,
+    vad_model: str | None = None,
+    punc_model: str | None = None,
+    spk_model: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve VAD/PUNC/SPK auxiliary models compatible with ``model_name``.
+
+    Returns ``(vad_model, punc_model, spk_model)`` with the auxiliary models
+    that should actually be passed to FunASR.
+
+    - VAD is always preserved: without it, ``AutoModel.generate()`` sends the
+      whole audio file to the GPU in one pass and crashes with CUDA
+      out-of-memory on long videos.
+    - PUNC (``ct-punc``) is preserved for every model so transcripts keep
+      punctuation.  SenseVoiceSmall does not emit punctuation natively.
+    - The explicit ``spk_model`` is preserved as-is.
+    """
+    return str(vad_model or ""), str(punc_model or ""), str(spk_model or "")
+
+
 def normalize_knowledge_embedding_provider(value: str | None, default: str = "local_huggingface") -> str:
     normalized = str(value or "").strip().lower()
     if not normalized:
@@ -551,7 +628,7 @@ class ServiceSettings(BaseSettings):
     multimodal_asr_api_key: str = ""
     multimodal_asr_chunk_duration_seconds: int = 180
     multimodal_asr_max_retries: int = 5
-    funasr_model: str = "paraformer-zh"
+    funasr_model: str = "auto"
     funasr_device: str = "cpu"
     funasr_vad_model: str = "fsmn-vad"
     funasr_punc_model: str = "ct-punc"
@@ -571,6 +648,7 @@ class ServiceSettings(BaseSettings):
     prompt_presets_path: str = ""
     llm_enabled: bool = False
     auto_generate_mindmap: bool = False
+    auto_export_obsidian: bool = False
     visual_note_mode: str = "text"
     visual_evidence_enabled: bool = False
     visual_multimodal_enabled: bool = False
@@ -627,6 +705,8 @@ class ServiceSettings(BaseSettings):
     summary_chunk_retry_count: int = 2
     ytdlp_cookies_file: str = ""
     ytdlp_cookies_browser: str = ""
+    ytdlp_youtube_cookies_file: str = ""
+    ytdlp_youtube_cookies_browser: str = ""
 
     model_config = SettingsConfigDict(
         env_prefix="VIDEO_SUM_",

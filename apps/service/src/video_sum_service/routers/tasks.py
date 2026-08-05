@@ -3,26 +3,28 @@ import json
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
-
 from video_sum_core.models.tasks import InputType, TaskStatus
 from video_sum_core.utils import normalize_video_url
 from video_sum_infra.config import normalize_visual_note_mode
 
+from video_sum_service.context import settings_manager
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.runtime_startup import submit_mindmap_or_queue, submit_task_or_queue
 from video_sum_service.schemas import (
     TaskCreateRequest,
     TaskDetailResponse,
     TaskEventResponse,
+    TaskMarkdownBatchExportRequest,
+    TaskMarkdownBatchExportResponse,
     TaskMarkdownExportRequest,
     TaskMarkdownExportResponse,
+    TaskMarkdownTagPreviewResponse,
     TaskMindMapResponse,
     TaskProgressResponse,
     TaskSummaryResponse,
     TaskTranscriptExportRequest,
     TaskVisualEvidenceResponse,
 )
-from video_sum_service.context import settings_manager
 from video_sum_service.task_artifacts import (
     cleanup_task_files,
     load_task_mindmap,
@@ -32,7 +34,13 @@ from video_sum_service.task_artifacts import (
 )
 from video_sum_service.task_exports import (
     export_task_markdown as export_task_markdown_artifact,
+)
+from video_sum_service.task_exports import (
     export_task_transcript as export_task_transcript_artifact,
+)
+from video_sum_service.task_exports import (
+    build_export_tag_preview,
+    export_tasks_markdown as export_tasks_markdown_artifact,
 )
 from video_sum_service.video_assets import probe_video_asset
 
@@ -68,6 +76,19 @@ def create_task(body: TaskCreateRequest, request: Request) -> TaskDetailResponse
 def list_tasks(request: Request) -> list[TaskSummaryResponse]:
     task_store: SqliteTaskRepository = request.app.state.task_repository
     return [record.to_summary() for record in task_store.list_tasks()]
+
+
+@router.post("/exports/markdown/batch", response_model=TaskMarkdownBatchExportResponse)
+def export_tasks_markdown(request: Request, body: TaskMarkdownBatchExportRequest) -> TaskMarkdownBatchExportResponse:
+    task_store: SqliteTaskRepository = request.app.state.task_repository
+    return export_tasks_markdown_artifact(
+        task_store,
+        settings_manager.current,
+        body.task_ids,
+        target=body.target,
+        include_transcript=body.include_transcript,
+        output_dir=body.output_dir,
+    )
 
 
 @router.get("/{task_id}", response_model=TaskDetailResponse)
@@ -296,6 +317,12 @@ def get_task_visual_evidence_media(task_id: str, file_name: str, request: Reques
     return FileResponse(target, media_type=media_type, filename=target.name)
 
 
+@router.get("/{task_id}/exports/markdown/preview", response_model=TaskMarkdownTagPreviewResponse)
+def preview_task_markdown_tags(request: Request, task_id: str) -> TaskMarkdownTagPreviewResponse:
+    task_store: SqliteTaskRepository = request.app.state.task_repository
+    return TaskMarkdownTagPreviewResponse(task_id=task_id, items=build_export_tag_preview(task_store, task_id))
+
+
 @router.post("/{task_id}/exports/markdown", response_model=TaskMarkdownExportResponse)
 def export_task_markdown(request: Request, task_id: str, body: TaskMarkdownExportRequest) -> TaskMarkdownExportResponse:
     task_store: SqliteTaskRepository = request.app.state.task_repository
@@ -306,6 +333,7 @@ def export_task_markdown(request: Request, task_id: str, body: TaskMarkdownExpor
         target=body.target,
         include_transcript=body.include_transcript,
         output_dir=body.output_dir,
+        tags=body.tags,
     )
 
 

@@ -7,6 +7,9 @@ type SetupAssistantDialogProps = {
   onClose(): void;
   onOpenSettings(): void;
   onNavigateToIssue(issueKey: string): void;
+  onAutoSetup(): void;
+  autoSetupBusy: boolean;
+  autoSetupStatus: string;
 };
 
 export function SetupAssistantDialog({
@@ -16,6 +19,9 @@ export function SetupAssistantDialog({
   onClose,
   onOpenSettings,
   onNavigateToIssue,
+  onAutoSetup,
+  autoSetupBusy,
+  autoSetupStatus,
 }: SetupAssistantDialogProps) {
   if (!isOpen || !configHealth.checked || (!force && configHealth.issues.length === 0)) {
     return null;
@@ -70,6 +76,13 @@ export function SetupAssistantDialog({
             </div>
           </div>
 
+          {autoSetupStatus ? (
+            <div className={`setup-assistant-status ${autoSetupBusy ? "tone-warning" : "tone-info"}`}>
+              <strong>{autoSetupBusy ? "正在自动安装本地能力" : "自动安装结果"}</strong>
+              <p>{autoSetupStatus}</p>
+            </div>
+          ) : null}
+
           {configHealth.issues.length > 0 ? (
             <div className="setup-assistant-issues">
               {configHealth.issues.map((issue) => (
@@ -93,8 +106,11 @@ export function SetupAssistantDialog({
         </div>
 
         <div className="update-dialog-footer">
-          <button className="secondary-button" type="button" onClick={onClose}>稍后再说</button>
-          <button className={configHealth.hasBlockingIssues ? "primary-button danger-button" : "primary-button"} type="button" onClick={onOpenSettings}>
+          <button className="secondary-button" type="button" onClick={onClose} disabled={autoSetupBusy}>稍后再说</button>
+          <button className="primary-button" type="button" onClick={onAutoSetup} disabled={autoSetupBusy}>
+            {autoSetupBusy ? "正在安装..." : "一键安装本地能力"}
+          </button>
+          <button className={configHealth.hasBlockingIssues ? "primary-button danger-button" : "primary-button"} type="button" onClick={onOpenSettings} disabled={autoSetupBusy}>
             {configHealth.actionText}
           </button>
         </div>

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -106,6 +107,89 @@ def format_timestamp(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|>]+\|>")
+_SENSEVOICE_MODEL_HINTS = ("sensevoice", "SenseVoiceSmall", "FunAudioLLM/SenseVoiceSmall")
+
+
+def _patch_safe_tokenizer_decode(model: object) -> None:
+    """Make the ASR model's BPE tokenizer tolerate out-of-vocabulary ids.
+
+    ``paraformer-en`` (and some other BPE models) can emit a piece id beyond
+    its vocabulary on long / unusual audio; ``sentencepiece`` then raises
+    ``IndexError: OUT_OF_RANGE: piece id is out of range`` during decode and
+    the whole transcription fails.  We wrap ``ids2tokens`` so offending ids
+    are replaced by ``<unk>`` instead of crashing.
+
+    The tokenizer is reached through ``model.model`` (the inner nn.Module)
+    which holds a reference to the tokenizer used by ``inference``.
+    """
+    # The ASR tokenizer lives in AutoModel.kwargs["tokenizer"] (set by
+    # AutoModel.build_model); the inner nn.Module receives it per-inference.
+    tokenizer = None
+    model_kwargs = getattr(model, "kwargs", None)
+    if isinstance(model_kwargs, dict):
+        tokenizer = model_kwargs.get("tokenizer")
+    if tokenizer is None:
+        inner = getattr(model, "model", None)
+        tokenizer = getattr(inner, "tokenizer", None)
+    if tokenizer is None:
+        return
+    vocab_size = getattr(tokenizer, "get_vocab_size", None)
+    if vocab_size is None:
+        return
+    try:
+        size = int(vocab_size())
+    except Exception:
+        return
+
+    original_ids2tokens = getattr(tokenizer, "ids2tokens", None)
+    if original_ids2tokens is None:
+        return
+
+    def _safe_ids2tokens(ids):
+        if isinstance(ids, list):
+            filtered = [i for i in ids if not (isinstance(i, int) and (i < 0 or i >= size))]
+        else:
+            filtered = ids
+        try:
+            return original_ids2tokens(filtered)
+        except Exception:
+            try:
+                return [str(original_ids2tokens([i])[0]) if 0 <= i < size else "<unk>" for i in (ids if isinstance(ids, list) else [])]
+            except Exception:
+                return ["<unk>"]
+
+    # Patch both the raw tokenizer and the wrapper AutoModel path.
+    setattr(tokenizer, "ids2tokens", _safe_ids2tokens)
+    decode_ids = getattr(tokenizer, "decode", None)
+    if decode_ids is not None and not getattr(decode_ids, "_bilisum_safe", False):
+
+        def _safe_decode(ids, *args, **kwargs):
+            if isinstance(ids, list):
+                ids = [i for i in ids if not (isinstance(i, int) and (i < 0 or i >= size))]
+            try:
+                return decode_ids(ids, *args, **kwargs)
+            except Exception:
+                return " ".join("<unk>" for _ in (ids if isinstance(ids, list) else []))
+
+        _safe_decode._bilisum_safe = True  # type: ignore[attr-defined]
+        setattr(tokenizer, "decode", _safe_decode)
+    logger.info("patched funasr tokenizer safe decode vocab_size=%s", size)
+
+
+def clean_sensevoice_text(text: str, model_name: str) -> str:
+    """Strip SenseVoice ``<|zh|>``/``<|NEUTRAL|>`` style tags from output.
+
+    SenseVoiceSmall returns rich text prefixed with language / emotion /
+    event tags such as ``<|zh|><|NEUTRAL|><|Speech|>``.  These tags must be
+    removed before building the transcript.
+    """
+    if not any(hint in (model_name or "") for hint in _SENSEVOICE_MODEL_HINTS):
+        return text
+    cleaned = _SENSEVOICE_TAG_RE.sub("", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def parse_funasr_result(
@@ -261,6 +345,7 @@ def transcribe_funasr(
     progress_path: Path,
     output_path: Path,
     duration: float | None,
+    language: str = "",
 ) -> None:
     configure_runtime_library_dirs()
 
@@ -290,10 +375,21 @@ def transcribe_funasr(
     _cleanup_stale_modelscope_locks()
 
     # Build model kwargs
+    # ncpu: FunASR defaults to 4 CPU threads for VAD/speaker-clustering and
+    # feature extraction, which starves multi-core machines.  Use up to half
+    # the available cores (capped) so CPU-side work keeps pace with the GPU.
+    _host_cpu_count = 0
+    try:
+        _host_cpu_count = max(1, int(os.cpu_count() or 0))
+    except Exception:
+        _host_cpu_count = 0
+    _funasr_ncpu = max(4, min(_host_cpu_count, 16) if _host_cpu_count else 4)
+
     model_kwargs = {
         "model": model_name,
         "device": device,
         "hub": hub,
+        "ncpu": _funasr_ncpu,
     }
 
     if vad_model:
@@ -327,14 +423,60 @@ def transcribe_funasr(
     if model is None:
         raise RuntimeError(f"Failed to load model {model_name} from any hub")
 
-    write_progress(
-        progress_path,
-        {
-            "stage": "transcribing",
-            "progress": 62,
-            "message": f"模型加载完成，正在转写音频 {audio_path.name}",
-        },
-    )
+    # Verify which device the models actually landed on.  This is a common
+    # failure mode: `--device cuda` is passed but torch silently falls back
+    # to CPU when CUDA is unavailable in the subprocess runtime.
+    try:
+        import torch
+        _asr_dev = str(next(model.model.parameters()).device) if hasattr(model, "model") else "n/a"
+        _vad_dev = str(next(model.vad_model.parameters()).device) if getattr(model, "vad_model", None) is not None else "n/a"
+        _punc_dev = str(next(model.punc_model.parameters()).device) if getattr(model, "punc_model", None) is not None else "n/a"
+        _spk_dev = str(next(model.spk_model.parameters()).device) if getattr(model, "spk_model", None) is not None else "n/a"
+        logger.info(
+            "funasr model devices cuda_available=%s asr=%s vad=%s punc=%s spk=%s",
+            torch.cuda.is_available(),
+            _asr_dev,
+            _vad_dev,
+            _punc_dev,
+            _spk_dev,
+        )
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("device requested=%s but torch.cuda.is_available()=False — falling back to CPU", device)
+        write_progress(
+            progress_path,
+            {
+                "stage": "transcribing",
+                "progress": 62,
+                "message": f"模型加载完成（asr={_asr_dev} vad={_vad_dev} punc={_punc_dev} spk={_spk_dev}），正在转写音频 {audio_path.name}",
+                "payload": {
+                    "cuda_available": torch.cuda.is_available(),
+                    "asr_device": _asr_dev,
+                    "vad_device": _vad_dev,
+                    "punc_device": _punc_dev,
+                    "spk_device": _spk_dev,
+                },
+            },
+        )
+    except Exception:
+        logger.debug("could not inspect funasr model devices", exc_info=True)
+        write_progress(
+            progress_path,
+            {
+                "stage": "transcribing",
+                "progress": 62,
+                "message": f"模型加载完成，正在转写音频 {audio_path.name}",
+            },
+        )
+
+    # Guard against "IndexError: OUT_OF_RANGE: piece id is out of range".
+    # sentencepiece's DecodeIds throws when the ASR model emits a token id
+    # beyond its BPE vocabulary (an occasional failure on long / unusual
+    # audio, e.g. a 50-minute English talk).  Filter such ids before decode
+    # so transcription survives instead of crashing the whole task.
+    try:
+        _patch_safe_tokenizer_decode(model)
+    except Exception:
+        logger.debug("could not patch funasr tokenizer decode", exc_info=True)
 
     # Build generate kwargs.
     # NOTE: do NOT pass sentence_timestamp=True — SEACO models return
@@ -343,12 +485,62 @@ def transcribe_funasr(
     generate_kwargs = {
         "input": str(audio_path),
         "batch_size": 1,
+        # Larger dynamic batch improves GPU utilization in VAD mode.
+        # ``inference_with_vad`` aggregates VAD segments until they reach
+        # ``batch_size_s`` seconds of audio before one GPU forward pass.
+        "batch_size_s": 300,
+        # Emit per-batch progress so the service can report a moving
+        # percentage instead of sitting at 62% for the whole transcription.
+        "disable_pbar": True,
     }
+
+    # SenseVoiceSmall defaults to language="auto", which can sprinkle Chinese
+    # / Japanese filler words into an English talk.  Pin the detected language
+    # so multilingual models transcribe in the correct language.
+    if language and language.lower() != "auto":
+        generate_kwargs["language"] = language
+    if "sensevoice" in model_name.lower() and language.lower() in {"en", "zh", "ja", "ko", "yue"}:
+        # SenseVoice's native ITN emits punctuation without a separate
+        # full-transcript punctuation pass.
+        generate_kwargs["use_itn"] = True
 
     if hotword:
         generate_kwargs["hotword"] = hotword
 
-    result = model.generate(**generate_kwargs)
+    _progress_lock = threading.Lock()
+    _progress_emitted: list[int] = []
+
+    def _report_progress(current: int, total: int) -> None:
+        """Map FunASR per-batch callback into the 62..84 progress window."""
+        if total <= 0:
+            return
+        fraction = max(0.0, min(1.0, current / total))
+        progress = 62 + int(fraction * 22)
+        with _progress_lock:
+            if _progress_emitted and progress <= _progress_emitted[-1]:
+                return
+            _progress_emitted.append(progress)
+        logger.info(
+            "funasr progress callback current=%s total=%s pct=%s progress=%s",
+            current,
+            total,
+            round(fraction * 100, 1),
+            progress,
+        )
+        write_progress(
+            progress_path,
+            {
+                "stage": "transcribing",
+                "progress": progress,
+                "message": f"正在转写音频 {audio_path.name}（{current}/{total}）",
+                "payload": {"current": current, "total": total, "fraction": round(fraction, 4)},
+            },
+        )
+
+    result = model.generate(
+        **generate_kwargs,
+        progress_callback=_report_progress,
+    )
 
     # Debug: log result structure so we can diagnose missing timestamps
     _sample = result
@@ -372,6 +564,15 @@ def transcribe_funasr(
             _si = _sample.get("sentence_info") or _sample.get("sentences")
             if isinstance(_si, list) and _si:
                 logger.info("funasr sentence sample[0]=%s", {k: v for k, v in _si[0].items() if k in ("text", "start", "end")})
+
+    # SenseVoice family returns rich text with language/emotion tags
+    # (e.g. <|zh|><|NEUTRAL|><|Speech|>).  Strip them before parsing.
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and "text" in item:
+                item["text"] = clean_sensevoice_text(str(item.get("text", "")), model_name)
+    elif isinstance(result, dict) and "text" in result:
+        result["text"] = clean_sensevoice_text(str(result.get("text", "")), model_name)
 
     # Parse result
     segments = parse_funasr_result(result, duration, progress_path)
@@ -439,6 +640,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-path", required=True)
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--duration", type=float)
+    parser.add_argument("--language", default="")
     return parser.parse_args()
 
 
@@ -458,6 +660,7 @@ def main() -> int:
             progress_path=Path(args.progress_path),
             output_path=Path(args.output_path),
             duration=args.duration,
+            language=args.language,
         )
     except Exception:
         logger.exception("child funasr transcription failed")

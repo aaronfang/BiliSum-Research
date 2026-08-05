@@ -244,6 +244,11 @@
     grid-template-columns: 1fr;
   }
 
+  .settings-input-action-row .secondary-button:first-of-type,
+  .settings-input-action-row .secondary-button:nth-of-type(2) {
+    grid-column: auto;
+  }
+
   .settings-tree-grid,
   .settings-model-summary-grid,
   .settings-visual-note-presets {
@@ -267,6 +272,10 @@
 }
 
 @media (max-width: 640px) {
+  .tag-export-dialog-backdrop {
+    padding: 12px;
+  }
+
   .grid-card {
     padding: 18px;
   }
@@ -298,6 +307,27 @@
 
   .update-dialog-footer .primary-button,
   .update-dialog-footer .secondary-button {
+    width: 100%;
+  }
+
+  .tag-export-dialog-header,
+  .tag-export-dialog-body,
+  .tag-export-dialog-footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .tag-export-dialog-add-row {
+    grid-template-columns: 1fr;
+  }
+
+  .tag-export-dialog-footer {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tag-export-dialog-footer .primary-button,
+  .tag-export-dialog-footer .secondary-button {
     width: 100%;
   }
 

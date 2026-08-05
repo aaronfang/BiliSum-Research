@@ -8,6 +8,7 @@ import { progressEventClass, stageLabel, taskStatusClass } from "../appModel";
 import { api } from "../api";
 import { CookieHelpDialog } from "../components/CookieHelpDialog";
 import { MarkdownContent } from "../components/MarkdownContent";
+import { TagExportDialog } from "../components/TagExportDialog";
 import { MultiPageSelectDialog } from "../components/MultiPageSelectDialog";
 import { FloatingNoticeStack } from "../components/FloatingNoticeStack";
 import {
@@ -29,7 +30,7 @@ import {
   type KnowledgeCard,
   type TaskPanelState,
 } from "../detailModel";
-import type { MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
+import type { MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMarkdownTagPreviewItem, TaskMindMapResponse, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
 import { formatDateTime, formatDuration, formatTaskDuration, formatTokenCount, sanitizeMindMapLabel, summarizeEvents, taskStatusLabel } from "../utils";
 import { buildPlayerEmbedDescriptor, withPlayerSeek } from "../videoPlayer";
 
@@ -331,6 +332,9 @@ function IconFavorite(props: SVGProps<SVGSVGElement>) {
 }
 
 function isBilibiliCookieHelpError(message: string) {
+  if (/YouTube|youtube\.com|youtu\.be/i.test(message)) {
+    return false;
+  }
   return /HTTP\s*412|cookies?\.txt|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
 }
 
@@ -360,6 +364,10 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   const [isExportingKnowledgeNote, setIsExportingKnowledgeNote] = useState(false);
   const [isExportingTranscript, setIsExportingTranscript] = useState(false);
   const [knowledgeNoteExportMenuOpen, setKnowledgeNoteExportMenuOpen] = useState(false);
+  const [tagExportDialogOpen, setTagExportDialogOpen] = useState(false);
+  const [tagExportItems, setTagExportItems] = useState<TaskMarkdownTagPreviewItem[]>([]);
+  const [tagExportPreviewLoading, setTagExportPreviewLoading] = useState(false);
+  const [tagExportPreviewError, setTagExportPreviewError] = useState("");
   const [includeTranscriptInNoteExport, setIncludeTranscriptInNoteExport] = useState(false);
   const [knowledgeOutputDir, setKnowledgeOutputDir] = useState("");
   const [lastKnowledgeExport, setLastKnowledgeExport] = useState<TaskMarkdownExportResponse | null>(null);
@@ -661,6 +669,9 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
     setMindMaps({});
     setMindMapLoading({});
     setKnowledgeNoteExportMenuOpen(false);
+    setTagExportDialogOpen(false);
+    setTagExportItems([]);
+    setTagExportPreviewError("");
     setLastKnowledgeExport(null);
     setSelectedPageNumber(null);
     setPageMenuOpen(false);
@@ -1578,12 +1589,30 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
     }
   }
 
-  async function handleExportKnowledgeNote(target: "markdown" | "obsidian" = "obsidian") {
+  async function handleOpenTagExportDialog() {
+    if (!selectedTaskId || tagExportPreviewLoading || isExportingKnowledgeNote) {
+      return;
+    }
+    setKnowledgeNoteExportMenuOpen(false);
+    setTagExportDialogOpen(true);
+    setTagExportPreviewLoading(true);
+    setTagExportPreviewError("");
+    try {
+      const response = await api.getTaskMarkdownTagPreview(selectedTaskId);
+      setTagExportItems(response.items);
+    } catch (error) {
+      setTagExportItems([]);
+      setTagExportPreviewError(error instanceof Error ? error.message : "标签预览加载失败");
+    } finally {
+      setTagExportPreviewLoading(false);
+    }
+  }
+
+  async function handleExportKnowledgeNote(target: "markdown" | "obsidian" = "obsidian", tags: string[] = tagExportItems.filter((item) => item.selected).map((item) => item.tag)) {
     if (!selectedTaskId || isExportingKnowledgeNote) {
       return;
     }
     setIsExportingKnowledgeNote(true);
-    setKnowledgeNoteExportMenuOpen(false);
     setStatus(target === "obsidian" ? "正在导出 Obsidian 笔记..." : "正在导出 Markdown 笔记...");
     try {
       const pickedDirectory = await window.desktop?.dialog?.pickDirectory?.(knowledgeOutputDir || undefined);
@@ -1595,13 +1624,17 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         target,
         include_transcript: includeTranscriptInNoteExport,
         output_dir: pickedDirectory || undefined,
+        tags,
       });
       setLastKnowledgeExport(response);
       setKnowledgeOutputDir((current) => current || response.directory);
+      setTagExportDialogOpen(false);
       await refreshDetail({ preferredTaskId: selectedTaskId, forceTaskIds: [selectedTaskId] });
       setStatus(`已导出到 ${response.file_name}`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "导出 Markdown 失败");
+      const message = error instanceof Error ? error.message : "导出 Markdown 失败";
+      setTagExportPreviewError(message);
+      setStatus(message);
     } finally {
       setIsExportingKnowledgeNote(false);
     }
@@ -1650,6 +1683,19 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         onOpenTutorial={openCookieExportTutorial}
         onOpenSettings={openYtdlpCookieSettings}
         onCaptureLoginCookies={captureLoginCookies}
+      />
+      <TagExportDialog
+        isOpen={tagExportDialogOpen}
+        title={video.title}
+        items={tagExportItems}
+        loading={tagExportPreviewLoading}
+        exporting={isExportingKnowledgeNote}
+        includeTranscript={includeTranscriptInNoteExport}
+        errorMessage={tagExportPreviewError}
+        onClose={() => setTagExportDialogOpen(false)}
+        onChangeItems={setTagExportItems}
+        onIncludeTranscriptChange={setIncludeTranscriptInNoteExport}
+        onExport={() => void handleExportKnowledgeNote("obsidian")}
       />
 
       {/* 分 P 跳转确认悬浮窗 */}
@@ -1934,18 +1980,37 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                               type="button"
                               tabIndex={actionMenuSection === "regenerate" ? 0 : -1}
                               disabled={isAggregateSummaryView}
+                              title={isAggregateSummaryView ? "全集总结不能直接重新转写，请先选择具体分 P" : "重新转写并生成文字总结"}
                               onClick={async () => {
                                 setActionMenuOpen(false);
                                 setActionMenuSection(null);
-                                setStatus("正在重新转写并生成摘要...");
-                                const visualNoteMode = loadKnowledgeNoteViewMode() === "visual" ? "frame_insert" : "text";
-                                await api.createVideoTask(video.video_id, { page_number: effectivePageNumber, visual_note_mode: visualNoteMode });
+                                setStatus("正在重新转写并生成文字总结...");
+                                await api.createVideoTask(video.video_id, { page_number: effectivePageNumber, visual_note_mode: "text" });
                                 await refreshDetail({ preferredTaskId: null, syncLibrary: true });
-                                setStatus("已开始新的转写摘要任务");
+                                setStatus("已开始新的转写文字总结任务");
                               }}
                             >
                               <IconTranscriptRefresh className="detail-action-icon" />
-                              <span>重新转写并生成</span>
+                              <span>重新转写（文字总结）</span>
+                            </button>
+                            <button
+                              className="detail-action-subitem"
+                              role="menuitem"
+                              type="button"
+                              tabIndex={actionMenuSection === "regenerate" ? 0 : -1}
+                              disabled={isAggregateSummaryView}
+                              title={isAggregateSummaryView ? "全集总结不能直接重新转写，请先选择具体分 P" : "重新转写并生成图文笔记"}
+                              onClick={async () => {
+                                setActionMenuOpen(false);
+                                setActionMenuSection(null);
+                                setStatus("正在重新转写并生成图文笔记...");
+                                await api.createVideoTask(video.video_id, { page_number: effectivePageNumber, visual_note_mode: "frame_insert" });
+                                await refreshDetail({ preferredTaskId: null, syncLibrary: true });
+                                setStatus("已开始新的转写图文笔记任务");
+                              }}
+                            >
+                              <IconCopyImage className="detail-action-icon" />
+                              <span>重新转写（图文笔记）</span>
                             </button>
                           </div>
 
@@ -2641,7 +2706,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                                 type="button"
                                 role="menuitem"
                                 disabled={!canExportSelectedKnowledgeNote || isExportingKnowledgeNote}
-                                onClick={() => void handleExportKnowledgeNote("obsidian")}
+                                onClick={() => void handleOpenTagExportDialog()}
                               >
                                 <span className="detail-section-menu-item-icon" aria-hidden="true">
                                   <IconExportNote />

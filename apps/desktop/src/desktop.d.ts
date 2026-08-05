@@ -68,6 +68,13 @@ type StorageCleanupResult = {
 type BilibiliCookieExportResult = {
   cookiesFile: string;
   cookieCount: number;
+  browser?: string;
+};
+
+type YoutubeCookieExportResult = {
+  cookiesFile: string;
+  cookieCount: number;
+  browser: string;
 };
 
 type DesktopBridge = {
@@ -104,6 +111,9 @@ type DesktopBridge = {
   };
   bilibili: {
     captureLoginCookies(): Promise<BilibiliCookieExportResult>;
+  };
+  youtube: {
+    captureLoginCookies(): Promise<YoutubeCookieExportResult>;
   };
   shell: {
     openPath(targetPath: string): Promise<string>;

@@ -5,6 +5,7 @@ import threading
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 from video_sum_core.models.tasks import TaskStatus
+from video_sum_infra.config import ServiceSettings
 from video_sum_infra.prompt_library import (
     BUILTIN_PRESETS,
     DEFAULT_PRESET_ID,
@@ -22,6 +23,7 @@ from video_sum_infra.runtime import (
     service_log_path,
 )
 
+from video_sum_service.auto_setup import AutoSetupPayload, run_auto_setup
 from video_sum_service.auth import (
     describe_token_source,
     extract_bearer_token,
@@ -515,6 +517,12 @@ def shutdown_service(request: Request) -> dict[str, object]:
 
     threading.Timer(0.5, shutdown).start()
     return {"shuttingDown": True, "message": "服务正在关闭。"}
+
+
+@router.post("/setup/auto")
+def post_auto_setup(request: Request, payload: dict[str, object] | None = None) -> dict[str, object]:
+    setup_payload = AutoSetupPayload.model_validate(payload or {})
+    return run_auto_setup(setup_payload, request.app.state)
 
 
 @router.post("/cuda/install")

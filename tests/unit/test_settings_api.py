@@ -147,6 +147,8 @@ def test_serialize_settings_includes_persisted_file_flag(monkeypatch, tmp_path: 
     assert payload["mindmap_concurrency"] == current.mindmap_concurrency
     assert payload["knowledge_note_system_prompt"] == current.knowledge_note_system_prompt
     assert payload["knowledge_note_user_prompt_template"] == current.knowledge_note_user_prompt_template
+    assert payload["ytdlp_youtube_cookies_file"] == ""
+    assert payload["ytdlp_youtube_cookies_browser"] == ""
     assert payload["visual_multimodal_enabled"] == current.visual_multimodal_enabled
     assert payload["visual_download_resolution"] == current.visual_download_resolution
     assert payload["visual_vlm_provider"] == current.visual_vlm_provider
@@ -1487,7 +1489,16 @@ def test_ensure_runtime_channel_syncs_base_preserves_macos_runtime(
     assert result == gpu_dir
     assert (gpu_bin / "python").read_text(encoding="utf-8") == "base-python"
     assert (gpu_lib / "libpython3.12.dylib").read_text(encoding="utf-8") == "base-libpython"
-    assert (gpu_dir / "pythonpath.pth").read_text(encoding="utf-8") == "base-pythonpath"
+    # In dev mode (not frozen) the runtime's pythonpath.pth is rewritten to
+    # point subprocesses at the live source tree, overriding the base copy.
+    assert (gpu_dir / "pythonpath.pth").read_text(encoding="utf-8") == "\n".join(
+        [
+            str(runtime_support.repo_root() / "packages" / "infra" / "src"),
+            str(runtime_support.repo_root() / "packages" / "core" / "src"),
+            str(runtime_support.repo_root() / "apps" / "service" / "src"),
+            "",
+        ]
+    )
     assert not (gpu_dir / "pyvenv.cfg").exists()
     assert (gpu_stdlib / "filecmp.py").read_text(encoding="utf-8") == "base-stdlib"
     assert (
