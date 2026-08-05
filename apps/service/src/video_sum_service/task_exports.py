@@ -60,7 +60,7 @@ def export_task_markdown(
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先在设置中配置输出目录，再导出 Markdown / Obsidian 笔记。")
 
-    export_directory = Path(output_dir_raw).expanduser()
+    export_directory = _resolve_export_directory(output_dir_raw)
     export_directory.mkdir(parents=True, exist_ok=True)
 
     video = repository.get_video_asset(record.video_id) if record.video_id else None
