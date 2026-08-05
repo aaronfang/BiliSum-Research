@@ -522,7 +522,13 @@ def shutdown_service(request: Request) -> dict[str, object]:
 @router.post("/setup/auto")
 def post_auto_setup(request: Request, payload: dict[str, object] | None = None) -> dict[str, object]:
     setup_payload = AutoSetupPayload.model_validate(payload or {})
-    return run_auto_setup(setup_payload, request.app.state)
+    try:
+        return run_auto_setup(setup_payload, request.app.state)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("automatic setup failed")
+        raise HTTPException(status_code=500, detail="自动配置失败，请查看服务日志。") from None
 
 
 @router.post("/cuda/install")

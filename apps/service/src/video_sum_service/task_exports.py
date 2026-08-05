@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from datetime import datetime
@@ -23,6 +24,11 @@ from video_sum_service.schemas import (
     TaskMarkdownExportResponse,
 )
 from video_sum_service.tag_utils import normalize_tag, tag_key
+
+
+def _resolve_export_directory(raw_path: str) -> Path:
+    expanded_path = os.path.expanduser(raw_path)
+    return Path(os.path.realpath(expanded_path))
 
 
 def export_task_markdown(
@@ -212,7 +218,7 @@ def export_task_transcript(
     if not output_dir_raw:
         raise HTTPException(status_code=400, detail="请先选择导出目录，或在设置中配置输出目录。")
 
-    export_directory = Path(output_dir_raw).expanduser()
+    export_directory = _resolve_export_directory(output_dir_raw)
     export_directory.mkdir(parents=True, exist_ok=True)
 
     video = repository.get_video_asset(record.video_id) if record.video_id else None

@@ -121,8 +121,18 @@ _SUPPORTED_COOKIE_BROWSERS = {
 }
 
 
+def _is_youtube_url(url: str) -> bool:
+    try:
+        raw_url = str(url or "").strip()
+        parsed = urlsplit(raw_url if "://" in raw_url else f"//{raw_url}")
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname in {"youtube.com", "youtu.be"} or hostname.endswith(".youtube.com")
+
+
 def _configure_youtube_runtime(options: dict[str, object], url: str) -> None:
-    if "youtube.com" not in url.lower() and "youtu.be" not in url.lower():
+    if not _is_youtube_url(url):
         return
     for runtime_name in ("deno", "node"):
         runtime_path = shutil.which(runtime_name)
@@ -190,6 +200,7 @@ def _kill_process_tree(process: subprocess.Popen) -> None:
                 **_windows_hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.SubprocessError):
+            # Best-effort cleanup; the portable fallback below still runs.
             pass
         try:
             process.kill()
@@ -1176,7 +1187,7 @@ class RealPipelineRunner(PipelineRunner):
         return options
 
     def _pick_cookie_file(self, url: str) -> str:
-        is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+        is_youtube = _is_youtube_url(url)
         if is_youtube:
             return str(
                 self._settings.ytdlp_youtube_cookies_file
@@ -1193,7 +1204,7 @@ class RealPipelineRunner(PipelineRunner):
         ).strip()
 
     def _pick_cookie_browser(self, url: str) -> str:
-        is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+        is_youtube = _is_youtube_url(url)
         if is_youtube:
             return str(
                 self._settings.ytdlp_youtube_cookies_browser
@@ -1211,7 +1222,7 @@ class RealPipelineRunner(PipelineRunner):
 
     def _raise_ydl_error(self, error: Exception, url: str = "") -> NoReturn:
         message = str(error)
-        is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+        is_youtube = _is_youtube_url(url)
         cookie_help = (
             "请在设置中填写 YouTube Cookies 文件，或通过“YouTube 登录获取”按钮捕获登录态。"
             if is_youtube
@@ -1232,11 +1243,7 @@ class RealPipelineRunner(PipelineRunner):
                 "/ VIDEO_SUM_YTDLP_COOKIES_FILE。"
             ) from error
         lowered_message = message.lower()
-        if (
-            "[youtube]" in lowered_message
-            or "youtube.com" in lowered_message
-            or "youtu.be" in lowered_message
-        ) and (
+        if "[youtube]" in lowered_message and (
             "sign in to confirm" in lowered_message
             or "not a bot" in lowered_message
             or "cookies-from-browser" in lowered_message
@@ -4405,7 +4412,7 @@ P 数索引：
         return timestamps or self._choose_visual_timestamps(result)
 
     def _attach_visual_keyframe_plan(self, frames: list[dict[str, object]], keyframes: list[dict[str, object]]) -> None:
-        for frame, planned in zip(frames, keyframes):
+        for frame, planned in zip(frames, keyframes, strict=False):
             frame["anchor_heading"] = str(planned.get("anchor_heading") or "").strip()
             frame["planned_concept"] = str(planned.get("concept") or "").strip()
             frame["planned_reason"] = str(planned.get("reason") or "").strip()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import io
 import json
 import os
 import re
@@ -1131,6 +1130,19 @@ def create_source_runtime(runtime_channel: str) -> Path:
     return runtime_dir
 
 
+def _managed_dev_runtime_dir(runtime_channel: str) -> Path:
+    normalized = normalize_runtime_channel(runtime_channel)
+    if normalized == "base":
+        return managed_runtime_dir("base")
+    if normalized == "gpu-cu124":
+        return managed_runtime_dir("gpu-cu124")
+    if normalized == "gpu-cu126":
+        return managed_runtime_dir("gpu-cu126")
+    if normalized == "gpu-cu128":
+        return managed_runtime_dir("gpu-cu128")
+    raise HTTPException(status_code=400, detail="Unsupported runtime channel.")
+
+
 def ensure_dev_pythonpath(runtime_channel: str) -> Path | None:
     """Point a managed runtime's subprocesses at the live project source.
 
@@ -1151,7 +1163,7 @@ def ensure_dev_pythonpath(runtime_channel: str) -> Path | None:
     """
     if is_frozen():
         return None
-    runtime_dir = managed_runtime_dir(runtime_channel)
+    runtime_dir = _managed_dev_runtime_dir(runtime_channel)
     if not runtime_dir.exists():
         return None
 

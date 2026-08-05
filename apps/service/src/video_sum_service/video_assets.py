@@ -47,8 +47,18 @@ _SUPPORTED_COOKIE_BROWSERS = {
 }
 
 
+def is_youtube_url(url: str) -> bool:
+    try:
+        raw_url = str(url or "").strip()
+        parsed = urlparse(raw_url if "://" in raw_url else f"//{raw_url}")
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    return hostname in {"youtube.com", "youtu.be"} or hostname.endswith(".youtube.com")
+
+
 def configure_youtube_runtime(options: dict[str, object], url: str) -> None:
-    if "youtube.com" not in url.lower() and "youtu.be" not in url.lower():
+    if not is_youtube_url(url):
         return
     for runtime_name in ("deno", "node"):
         runtime_path = shutil.which(runtime_name)
@@ -125,11 +135,6 @@ def build_page_title(base_title: str, page: int, info: dict[str, object]) -> str
     if not candidate:
         return f"P{page}"
     return f"P{page} {candidate}"
-
-
-def is_youtube_url(url: str) -> bool:
-    lowered = str(url or "").lower()
-    return "youtube.com" in lowered or "youtu.be" in lowered
 
 
 def pick_ytdlp_cookie_file(url: str) -> str:
@@ -246,10 +251,7 @@ def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, obj
                 ),
             ) from exc
         lowered_message = message.lower()
-        if (
-            "youtube.com" in url.lower()
-            or "youtu.be" in url.lower()
-        ) and (
+        if is_youtube_url(url) and (
             "sign in to confirm" in lowered_message
             or "not a bot" in lowered_message
             or "cookies-from-browser" in lowered_message
