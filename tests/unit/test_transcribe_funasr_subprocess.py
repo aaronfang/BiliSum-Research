@@ -402,6 +402,11 @@ class TestTranscribeFunasr:
         assert result["segments"][0]["text"] == "测试转写结果"
 
         mock_automodel.assert_called_once()
+        model_kwargs = mock_automodel.call_args.kwargs
+        assert model_kwargs["disable_update"] is True
+        generate_kwargs = mock_model.generate.call_args.kwargs
+        assert generate_kwargs["batch_size_s"] == 30
+        assert generate_kwargs["batch_size_threshold_s"] == 30
         mock_model.generate.assert_called_once()
 
     @patch("video_sum_core.transcribe_funasr_subprocess.configure_runtime_library_dirs")

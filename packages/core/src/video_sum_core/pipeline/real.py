@@ -108,6 +108,10 @@ _BILIBILI_HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://www.bilibili.com/",
 }
+_YOUTUBE_HTTP_HEADERS = {
+    "User-Agent": _BILIBILI_HTTP_HEADERS["User-Agent"],
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
 _SUPPORTED_COOKIE_BROWSERS = {
     "brave",
     "chrome",
@@ -218,7 +222,7 @@ def _safe_int(value: object) -> int | None:
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
-    """Coerce LLM numeric fields, tolerating singleton list wrappers."""
+    """Coerce LLM numeric fields, including common ``M:SS`` timecodes."""
     if isinstance(value, (list, tuple)):
         if not value:
             return default
@@ -228,10 +232,36 @@ def _safe_float(value: object, default: float = 0.0) -> float:
             if key in value:
                 return _safe_float(value[key], default)
         return default
+    if value is None:
+        return default
+
+    text = str(value).strip()
+    if not text:
+        return default
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) not in (2, 3):
+            return default
+        try:
+            numbers = [float(part) for part in parts]
+        except (TypeError, ValueError):
+            return default
+        if any(not math.isfinite(part) or part < 0 for part in numbers):
+            return default
+        if len(numbers) == 2:
+            minutes, seconds = numbers
+            if seconds >= 60:
+                return default
+            return minutes * 60 + seconds
+        hours, minutes, seconds = numbers
+        if minutes >= 60 or seconds >= 60:
+            return default
+        return hours * 3600 + minutes * 60 + seconds
     try:
-        return float(value) if value is not None and str(value).strip() else default
+        parsed = float(text)
     except (TypeError, ValueError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _truncate_text(value: str, limit: int) -> str:
@@ -1164,7 +1194,7 @@ class RealPipelineRunner(PipelineRunner):
         options: dict[str, object] = {
             "quiet": True,
             "no_warnings": True,
-            "http_headers": _BILIBILI_HTTP_HEADERS,
+            "http_headers": dict(_YOUTUBE_HTTP_HEADERS if _is_youtube_url(url) else _BILIBILI_HTTP_HEADERS),
             "retries": 3,
             "extractor_retries": 3,
             "fragment_retries": 3,
@@ -2645,9 +2675,24 @@ class RealPipelineRunner(PipelineRunner):
             # this long is stuck; do not leave a GPU worker orphaned forever.
             if now - last_activity_at > stall_timeout:
                 _kill_process_tree(process)
+                _drain_stdout_thread.join(timeout=2)
+                _drain_stderr_thread.join(timeout=2)
+                stdout = "".join(_funasr_stdout_lines).strip()
+                stderr = "".join(_funasr_stderr_lines).strip()
+                logger.error(
+                    "funasr subprocess stalled audio=%s model=%s device=%s stdout=%s stderr=%s",
+                    audio_path,
+                    model_name,
+                    device,
+                    stdout[-1500:],
+                    stderr[-1500:],
+                )
+                detail = stderr[-500:].replace("\n", " ").strip()
+                suffix = f" Last output: {detail}" if detail else ""
                 raise VideoSumError(
                     "FunASR subprocess produced no progress/output after 10 minutes. "
                     "Check network, ModelScope, or the audio/model configuration."
+                    f"{suffix}"
                 )
             if now > deadline:
                 _kill_process_tree(process)
@@ -4873,7 +4918,7 @@ P 数索引：
         best_delta = float("inf")
         for chapter in chapters:
             try:
-                start = float(chapter.get("start") or 0)
+                start = _safe_float(chapter.get("start"))
             except (TypeError, ValueError):
                 start = 0.0
             delta = abs(timestamp - start)
@@ -5678,7 +5723,7 @@ P 数索引：
         if final_chapters:
             lines.append("## 合并后的全局章节")
             for chapter in final_chapters:
-                start = float(chapter.get("start") or 0)
+                start = _safe_float(chapter.get("start"))
                 chapter_title = str(chapter.get("title") or "").strip()
                 summary = str(chapter.get("summary") or "").strip()
                 if not summary:
@@ -5705,7 +5750,7 @@ P 数索引：
             for point in bullet_points[:6]:
                 lines.append(f"- {point}")
             for chapter in chapters[:6]:
-                start = float(chapter.get("start") or 0)
+                start = _safe_float(chapter.get("start"))
                 summary = str(chapter.get("summary") or "").strip()
                 chapter_title = str(chapter.get("title") or f"章节 {chunk_index}")
                 if summary:
@@ -5970,7 +6015,7 @@ P 数索引：
             for index, chapter in enumerate(chapters, start=1):
                 chapter_title = str(chapter.get("title") or f"章节 {index}").strip()
                 chapter_summary = str(chapter.get("summary") or "").strip()
-                start = float(chapter.get("start") or 0)
+                start = _safe_float(chapter.get("start"))
                 sections.extend(
                     [
                         "",
@@ -6075,11 +6120,11 @@ P 数索引：
         seen_keys: set[tuple[int, str]] = set()
 
         for partial in partial_summaries:
-            chunk_start = float(partial.get("chunk_start") or 0)
-            chunk_end = float(partial.get("chunk_end") or chunk_start)
+            chunk_start = _safe_float(partial.get("chunk_start"))
+            chunk_end = _safe_float(partial.get("chunk_end"), chunk_start)
             chapters = self._coerce_chapters(partial.get("chapters"), segments)
             for chapter in chapters:
-                start = self._align_chapter_start(float(chapter.get("start") or chunk_start), segments, chunk_start, chunk_end)
+                start = self._align_chapter_start(_safe_float(chapter.get("start"), chunk_start), segments, chunk_start, chunk_end)
                 title = str(chapter.get("title") or "").strip()
                 summary = str(chapter.get("summary") or "").strip()
                 if not summary:
@@ -6109,7 +6154,7 @@ P 数索引：
             normalized.append(
                 {
                     "title": title,
-                    "start": float(chapter.get("start") or 0),
+                    "start": _safe_float(chapter.get("start")),
                     "summary": str(chapter.get("summary") or "").strip()[:160],
                 }
             )
@@ -6120,7 +6165,7 @@ P 数索引：
         chapters: list[dict[str, object]],
         chapter: dict[str, object],
     ) -> None:
-        start = float(chapter.get("start") or 0)
+        start = _safe_float(chapter.get("start"))
         title_key = self._dedupe_text_key(str(chapter.get("title") or ""))
         summary = str(chapter.get("summary") or "").strip()
 
@@ -6246,7 +6291,7 @@ P 数索引：
             chapters.append(
                 {
                     "title": title,
-                    "start": float(item.get("start") or 0),
+                    "start": _safe_float(item.get("start")),
                     "summary": summary[:160],
                 }
             )
@@ -6307,7 +6352,7 @@ P 数索引：
             groups.append(
                 {
                     "title": title,
-                    "start": float(item.get("start") or children[0].get("start") or 0),
+                    "start": _safe_float(item.get("start"), _safe_float(children[0].get("start"))),
                     "summary": summary,
                     "children": children,
                 }
@@ -6450,7 +6495,7 @@ P 数索引：
 
             buckets: list[list[dict[str, object]]] = []
             for chapter in ordered:
-                start = float(chapter.get("start") or 0)
+                start = _safe_float(chapter.get("start"))
                 bucket_index = min(target_count - 1, max(0, int((start - 1) / window_size)))
                 while len(buckets) <= bucket_index:
                     buckets.append([])
@@ -6470,7 +6515,7 @@ P 数索引：
                 deduped: list[dict[str, object]] = []
                 seen: set[tuple[int, str]] = set()
                 for chapter in sampled:
-                    key = (int(float(chapter.get("start") or 0)), self._dedupe_text_key(str(chapter.get("title") or "")))
+                    key = (int(_safe_float(chapter.get("start"))), self._dedupe_text_key(str(chapter.get("title") or "")))
                     if key in seen:
                         continue
                     seen.add(key)
@@ -6491,7 +6536,7 @@ P 数索引：
 
         buckets: list[list[dict[str, object]]] = []
         for chapter in ordered:
-            start = float(chapter.get("start") or 0)
+            start = _safe_float(chapter.get("start"))
             bucket_index = min(target_count - 1, max(0, int((start - first_start) / window_size)))
             while len(buckets) <= bucket_index:
                 buckets.append([])
@@ -6511,7 +6556,7 @@ P 数索引：
             deduped: list[dict[str, object]] = []
             seen: set[tuple[int, str]] = set()
             for chapter in sampled:
-                key = (int(float(chapter.get("start") or 0)), self._dedupe_text_key(str(chapter.get("title") or "")))
+                key = (int(_safe_float(chapter.get("start"))), self._dedupe_text_key(str(chapter.get("title") or "")))
                 if key in seen:
                     continue
                 seen.add(key)

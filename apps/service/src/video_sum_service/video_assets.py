@@ -34,6 +34,10 @@ _BILIBILI_HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://www.bilibili.com/",
 }
+_YOUTUBE_HTTP_HEADERS = {
+    "User-Agent": _BILIBILI_HTTP_HEADERS["User-Agent"],
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
 _SUPPORTED_COOKIE_BROWSERS = {
     "brave",
     "chrome",
@@ -64,7 +68,8 @@ def configure_youtube_runtime(options: dict[str, object], url: str) -> None:
         runtime_path = shutil.which(runtime_name)
         if runtime_path:
             options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
-            return
+            break
+    options["remote_components"] = ["ejs:github"]
 
 
 LOCAL_VIDEO_SUFFIXES = {
@@ -177,7 +182,9 @@ def build_ydl_probe_options(url: str = "", *, extract_flat: bool = False) -> dic
     options: dict[str, object] = {
         "quiet": True,
         "no_warnings": True,
-        "http_headers": _BILIBILI_HTTP_HEADERS,
+        "http_headers": dict(
+            _YOUTUBE_HTTP_HEADERS if is_youtube_url(url) else _BILIBILI_HTTP_HEADERS
+        ),
         "retries": 3,
         "extractor_retries": 3,
         "fragment_retries": 3,

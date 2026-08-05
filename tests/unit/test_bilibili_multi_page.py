@@ -492,6 +492,8 @@ def test_build_ydl_probe_options_keeps_bilibili_and_youtube_cookies_separate(mon
 
     assert bilibili_options["cookiefile"] == str(bilibili_file)
     assert youtube_options["cookiefile"] == str(youtube_file)
+    assert bilibili_options["http_headers"]["Referer"] == "https://www.bilibili.com/"
+    assert "Referer" not in youtube_options["http_headers"]
 
 
 def test_extract_video_info_configures_available_javascript_runtime(monkeypatch) -> None:
@@ -524,6 +526,7 @@ def test_extract_video_info_configures_available_javascript_runtime(monkeypatch)
 
     assert info["title"] == "测试视频"
     assert captured_options["js_runtimes"] == {"node": {"path": "C:/Program Files/nodejs/node.exe"}}
+    assert captured_options["remote_components"] == ["ejs:github"]
 
 
 def test_probe_video_asset_returns_youtube_single_video(monkeypatch) -> None:
